@@ -1,6 +1,5 @@
-import { supabase } from './supabase'
 import { Commit } from './types'
-import { hashContent } from './versioning'
+import { hashContent, getCommitHistory } from './versioning'
 
 export interface IntegrityResult {
     isValid: boolean
@@ -10,28 +9,24 @@ export interface IntegrityResult {
 }
 
 export async function verifyChain(repoId: string): Promise<IntegrityResult> {
-    const { data: commits, error } = await supabase
-        .from('commits')
-        .select('*')
-        .eq('repo_id', repoId)
-        .order('created_at', { ascending: true })
+    const commits = await getCommitHistory(repoId)
+    const sorted = [...commits].reverse() // ascending order
 
-    if (error) throw error
-    if (!commits || commits.length === 0) {
+    if (sorted.length === 0) {
         return { isValid: true, totalCommits: 0, verifiedCommits: 0 }
     }
 
     let previousIntegrity = '0'.repeat(64)
     let verifiedCount = 0
 
-    for (const commit of commits) {
+    for (const commit of sorted) {
         const expectedInput = `${commit.tree_hash}${previousIntegrity}${commit.message}${commit.created_at}`
         const expectedHash = await hashContent(expectedInput)
 
         if (expectedHash !== commit.integrity_hash) {
             return {
                 isValid: false,
-                totalCommits: commits.length,
+                totalCommits: sorted.length,
                 verifiedCommits: verifiedCount,
                 brokenAt: commit.id
             }
@@ -43,7 +38,7 @@ export async function verifyChain(repoId: string): Promise<IntegrityResult> {
 
     return {
         isValid: true,
-        totalCommits: commits.length,
+        totalCommits: sorted.length,
         verifiedCommits: verifiedCount
     }
 }

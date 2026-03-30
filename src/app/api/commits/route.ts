@@ -36,20 +36,33 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'repoId and files required' }, { status: 400 })
     }
 
-    let aiSummary: string | undefined
+    // 1. Instantly save the raw commit data
+    const commit = await createCommit(repoId, message, files, userId)
+
+    // 2. Offload heavy AI Mentorship processing to Amazon SQS
     try {
-        const history = await getCommitHistory(repoId)
-        if (history.length > 0) {
-            const diffs = await computeDiff(repoId, history[0].id, '')
-            if (diffs.length > 0) {
-                aiSummary = await generateCommitSummary(diffs)
+        const { SQSClient, SendMessageCommand } = await import('@aws-sdk/client-sqs')
+        const sqs = new SQSClient({
+            region: process.env.NEXT_PUBLIC_AWS_REGION || process.env.AWS_REGION || 'eu-north-1',
+            credentials: {
+                accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+                secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
             }
-        }
-    } catch {
-        // AI summary is optional
+        })
+
+        await sqs.send(new SendMessageCommand({
+            QueueUrl: process.env.AWS_SQS_QUEUE_URL || 'cloudvcs-mentor-queue',
+            MessageBody: JSON.stringify({
+                repoId,
+                commitId: commit.id,
+                userId
+            })
+        }))
+        console.log(`[SQS] Sent commit ${commit.id} to Mentor Queue.`)
+    } catch (e) {
+        console.error('[SQS ERROR] Failed to notify SQS:', e)
     }
 
-    const commit = await createCommit(repoId, message, files, userId, aiSummary)
     return NextResponse.json(commit, { status: 201 })
 }
 

@@ -30,6 +30,15 @@ export async function POST(req: NextRequest) {
         }
     } catch (error) {
         const message = error instanceof Error ? error.message : 'AI service error'
-        return NextResponse.json({ error: message }, { status: 500 })
+        console.error('[AI Review Error]', message)
+        // Return as 200 with error field so the UI can display it gracefully
+        return NextResponse.json({
+            error: message,
+            summary: message,
+            bugs: [], suggestions: [], security: [],
+            explanation: message,
+            answer: message,
+            fix: null
+        })
     }
 }

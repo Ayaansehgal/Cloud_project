@@ -7,6 +7,36 @@ function getGenAI() {
     return new GoogleGenerativeAI(apiKey)
 }
 
+// Try primary model, fall back to flash-lite on quota errors
+async function generateWithFallback(prompt: string): Promise<string> {
+    const genAI = getGenAI()
+    const models = ['gemini-2.5-flash', 'gemini-2.0-flash-lite', 'gemini-pro']
+    let lastError: Error = new Error('All models failed')
+
+    for (const modelName of models) {
+        try {
+            const model = genAI.getGenerativeModel({ model: modelName })
+            const result = await model.generateContent(prompt)
+            return result.response.text().trim()
+        } catch (err) {
+            lastError = err instanceof Error ? err : new Error(String(err))
+            const msg = lastError.message || ''
+            // Extract retryDelay if present and surface a friendly error
+            const retryMatch = msg.match(/retryDelay.*?(\d+)s/)
+            if (retryMatch) {
+                throw new Error(`Gemini API quota exceeded. Please retry in ${retryMatch[1]} seconds.`)
+            }
+            // If it's a quota/rate error, try the next model
+            if (msg.includes('429') || msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED')) {
+                continue
+            }
+            // Non-quota error — throw immediately
+            throw lastError
+        }
+    }
+    throw lastError
+}
+
 function formatDiffForAI(diffs: DiffEntry[]): string {
     return diffs.map(d => {
         const header = `--- ${d.path} [${d.status}]`
@@ -17,24 +47,16 @@ function formatDiffForAI(diffs: DiffEntry[]): string {
 }
 
 export async function generateCommitSummary(diffs: DiffEntry[]): Promise<string> {
-    const genAI = getGenAI()
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' })
-
     const prompt = `You are a code review assistant. Analyze the following code changes and write a concise, meaningful commit message (1-2 sentences max). Focus on WHAT changed and WHY.
 
 Changes:
 ${formatDiffForAI(diffs)}
 
 Commit message:`
-
-    const result = await model.generateContent(prompt)
-    return result.response.text().trim()
+    return generateWithFallback(prompt)
 }
 
 export async function reviewCode(diffs: DiffEntry[]): Promise<AIReviewResult> {
-    const genAI = getGenAI()
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' })
-
     const prompt = `You are a senior code reviewer. Analyze these code changes and respond in valid JSON with this exact structure:
 {
   "summary": "Brief summary of changes",
@@ -50,26 +72,23 @@ ${formatDiffForAI(diffs)}
 
 JSON response:`
 
-    const result = await model.generateContent(prompt)
-    const text = result.response.text().trim()
+    const text = await generateWithFallback(prompt)
 
     try {
-        const cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '')
-        return JSON.parse(cleaned)
-    } catch {
+        const cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
+        const parsed = JSON.parse(cleaned)
         return {
-            summary: text,
-            bugs: [],
-            suggestions: [],
-            security: []
+            summary: parsed.summary || text,
+            bugs: Array.isArray(parsed.bugs) ? parsed.bugs : [],
+            suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : [],
+            security: Array.isArray(parsed.security) ? parsed.security : [],
         }
+    } catch {
+        return { summary: text, bugs: [], suggestions: [], security: [] }
     }
 }
 
 export async function explainCode(code: string, filename: string): Promise<string> {
-    const genAI = getGenAI()
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' })
-
     const prompt = `Explain this code in simple terms that a beginner can understand. Be concise (3-5 sentences max).
 
 File: ${filename}
@@ -78,15 +97,10 @@ ${code}
 \`\`\`
 
 Explanation:`
-
-    const result = await model.generateContent(prompt)
-    return result.response.text().trim()
+    return generateWithFallback(prompt)
 }
 
 export async function suggestFix(code: string, issue: string): Promise<string> {
-    const genAI = getGenAI()
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' })
-
     const prompt = `Fix the following issue in this code. Return ONLY the corrected code, no explanation.
 
 Issue: ${issue}
@@ -96,24 +110,18 @@ ${code}
 \`\`\`
 
 Fixed code:`
-
-    const result = await model.generateContent(prompt)
-    return result.response.text().trim().replace(/```[\w]*\n?/g, '').replace(/```\n?/g, '')
+    const text = await generateWithFallback(prompt)
+    return text.replace(/```[\w]*\n?/g, '').replace(/```\n?/g, '').trim()
 }
 
 export async function chatWithAI(question: string, codeContext: string): Promise<string> {
-    const genAI = getGenAI()
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' })
-
     const prompt = `You are a helpful coding assistant. Answer the user's question about their codebase. Be concise and practical.
 
 Codebase context:
-${codeContext}
+${codeContext.slice(0, 8000)}
 
 User question: ${question}
 
 Answer:`
-
-    const result = await model.generateContent(prompt)
-    return result.response.text().trim()
+    return generateWithFallback(prompt)
 }

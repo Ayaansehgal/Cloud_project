@@ -1,12 +1,12 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import {
     GitBranch, GitCommit, Upload, Clock, Shield, ShieldCheck, ShieldAlert,
     FileCode, Brain, MessageSquare, Send, RotateCcw, Loader2, ArrowLeft, Sparkles, Bug, Lightbulb,
-    AlertTriangle, X, Plus, Edit3, Save, Trash2, Play
+    AlertTriangle, X, Plus, Edit3, Save, Trash2, Play, ChevronRight, Check, FolderOpen
 } from 'lucide-react'
 import { Repository, Commit, TreeEntry, AIReviewResult } from '@/lib/types'
 import { supabase } from '@/lib/supabase'
@@ -15,6 +15,7 @@ export default function RepoPage() {
     const params = useParams()
     const router = useRouter()
     const repoId = params.id as string
+    const fileInputRef = useRef<HTMLInputElement>(null)
     const [user, setUser] = useState<{ id: string; email: string } | null>(null)
     const [repo, setRepo] = useState<Repository | null>(null)
     const [commits, setCommits] = useState<Commit[]>([])
@@ -43,17 +44,26 @@ export default function RepoPage() {
     const [aiReview, setAiReview] = useState<AIReviewResult | null>(null)
     const [aiExplanation, setAiExplanation] = useState('')
     const [aiLoading, setAiLoading] = useState(false)
-    const [chatMessages, setChatMessages] = useState<{ role: string; text: string }[]>([])
+    const [mentorAnalytics, setMentorAnalytics] = useState<{ timestamp: string, commitId: string, readabilityScore: number, mentorFeedback: string, criticalBug: boolean }[]>([])
+    const [chatMessages, setChatMessages] = useState<{
+        role: string; text: string;
+        fixData?: { fix: string; path: string; originalContent: string }
+    }[]>([])
     const [chatInput, setChatInput] = useState('')
 
     const [onlineUsers, setOnlineUsers] = useState<{ email: string; current_file: string | null }[]>([])
 
     const fetchRepo = useCallback(async (userId: string) => {
         try {
-            const [repoRes, commitsRes] = await Promise.all([
+            const [repoRes, commitsRes, analyticsRes] = await Promise.all([
                 supabase.from('repositories').select('*').eq('id', repoId).single(),
-                fetch(`/api/commits?repoId=${repoId}`)
+                fetch(`/api/commits?repoId=${repoId}`),
+                fetch(`/api/analytics?repoId=${repoId}`)
             ])
+            if (analyticsRes.ok) {
+                const analyticsData = await analyticsRes.json()
+                if (Array.isArray(analyticsData)) setMentorAnalytics(analyticsData)
+            }
             if (repoRes.data) setRepo(repoRes.data)
             const commitsData = await commitsRes.json()
             if (Array.isArray(commitsData)) {
@@ -229,19 +239,85 @@ export default function RepoPage() {
     }
 
     async function handleAIFix(issue: string) {
-        if (!selectedFile) return
+        // Use the selected file if available, otherwise use the first file
+        const targetFile = selectedFile || files[0] || null
+        const codeForFix = targetFile ? targetFile.content || '' : ''
+        const filenameForFix = targetFile?.path || ''
+
+        if (!codeForFix.trim()) {
+            setChatMessages(prev => [...prev, { role: 'ai', text: 'No code found to fix. Please select a file first.' }])
+            setTab('ai')
+            return
+        }
+
         setAiLoading(true)
+        setTab('ai')
+        // First post a "thinking" message
+        setChatMessages(prev => [...prev, { role: 'ai', text: `Generating fix for: "${issue}"...` }])
         try {
             const res = await fetch('/api/ai-review', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: 'fix', code: selectedFile.content, filename: selectedFile.path, issue })
+                body: JSON.stringify({ action: 'fix', code: codeForFix, filename: filenameForFix, issue })
             })
             const data = await res.json()
-            if (data.fix) {
-                setChatMessages(prev => [...prev, { role: 'ai', text: `💡 Fix suggestion for "${issue}":\n\n${data.fix}` }])
+            const fixCode = data.fix
+            if (!fixCode || data.error) {
+                setChatMessages(prev => {
+                    const updated = [...prev]
+                    updated[updated.length - 1] = { role: 'ai', text: `${data.error || 'Could not generate fix.'}` }
+                    return updated
+                })
+                return
             }
-        } catch { }
+            // Replace thinking message with confirmation prompt + the fix code + action buttons
+            setChatMessages(prev => {
+                const updated = [...prev]
+                updated[updated.length - 1] = {
+                    role: 'ai',
+                    text: `Fix suggestion for "${issue}" in \`${filenameForFix}\`:\n\n\`\`\`\n${fixCode}\n\`\`\`\n\nShould I apply this fix to the file?`,
+                    fixData: { fix: fixCode, path: filenameForFix, originalContent: codeForFix }
+                }
+                return updated
+            })
+        } catch {
+            setChatMessages(prev => {
+                const updated = [...prev]
+                updated[updated.length - 1] = { role: 'ai', text: 'Failed to generate fix. Please try again.' }
+                return updated
+            })
+        }
         finally { setAiLoading(false) }
+    }
+
+    function applyFix(msgIndex: number) {
+        const msg = chatMessages[msgIndex]
+        if (!msg?.fixData) return
+        const { fix, path } = msg.fixData
+        // Apply to files state
+        setFiles(prev => prev.map(f => f.path === path ? { ...f, content: fix } : f))
+        if (selectedFile?.path === path) {
+            setSelectedFile(prev => prev ? { ...prev, content: fix } : prev)
+            setEditContent(fix)
+        }
+        // Stage the change
+        setStagedChanges(prev => {
+            const without = prev.filter(s => s.path !== path)
+            return [...without, { path, content: fix }]
+        })
+        // Confirm in chat + remove the fix data so buttons disappear
+        setChatMessages(prev => prev.map((m, i) =>
+            i === msgIndex
+                ? { role: 'ai', text: `Fix applied to \`${path}\`. The change is staged — commit when ready.` }
+                : m
+        ))
+    }
+
+    function dismissFix(msgIndex: number) {
+        setChatMessages(prev => prev.map((m, i) =>
+            i === msgIndex
+                ? { role: 'ai', text: 'Fix dismissed.' }
+                : m
+        ))
     }
 
     async function handleChat(e: React.FormEvent) {
@@ -267,303 +343,410 @@ export default function RepoPage() {
 
     if (loading) {
         return (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: 'var(--bg-page)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', background: 'var(--bg-page)', flexDirection: 'column', gap: '16px' }}>
                 <Loader2 size={32} className="animate-spin" color="var(--accent)" />
+                <p style={{ color: 'var(--text-muted)', fontSize: '14px' }}>Loading repository...</p>
             </div>
         )
     }
 
     const activeSliderFiles = sliderFiles.length > 0 ? sliderFiles : files
-    const tabStyle = (t: string) => ({
-        padding: '8px 20px', borderRadius: '8px', border: 'none', cursor: 'pointer' as const,
-        background: tab === t ? 'var(--accent)' : 'transparent',
-        color: tab === t ? 'white' : 'var(--text-secondary)',
-        fontWeight: 600 as const, fontSize: '14px', transition: 'all 0.2s',
-        display: 'flex' as const, alignItems: 'center' as const, gap: '6px'
-    })
 
     return (
         <div style={{ minHeight: '100vh', background: 'var(--bg-page)' }}>
+            {/* Top navigation bar */}
             <nav style={{
                 display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                padding: '12px 32px', background: 'var(--bg-secondary)',
-                borderBottom: '1px solid var(--border)', position: 'sticky', top: 0, zIndex: 100
+                padding: '12px 28px',
+                background: 'rgba(255,255,255,0.85)',
+                backdropFilter: 'blur(12px)',
+                WebkitBackdropFilter: 'blur(12px)',
+                borderBottom: '1px solid var(--border)',
+                position: 'sticky', top: 0, zIndex: 100,
             }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
-                    <Link href="/dashboard"><ArrowLeft size={20} color="var(--text-secondary)" /></Link>
-                    <GitBranch size={20} color="var(--accent)" />
-                    <span style={{ fontSize: '17px', fontWeight: 700 }}>{repo?.name || 'Repository'}</span>
-                    {stagedChanges.length > 0 && (
-                        <span className="badge badge-warning">{stagedChanges.length} unsaved change{stagedChanges.length > 1 ? 's' : ''}</span>
-                    )}
-                </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    {onlineUsers.length > 0 && (
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                            <div style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--success)' }} />
-                            <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>{onlineUsers.length} online</span>
-                            <div style={{ display: 'flex', marginLeft: '4px' }}>
-                                {onlineUsers.slice(0, 3).map((u, i) => (
-                                    <div key={i} title={u.email} style={{
-                                        width: 26, height: 26, borderRadius: '50%', background: 'var(--accent)',
-                                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                        fontSize: '11px', fontWeight: 700, color: 'white',
-                                        border: '2px solid var(--bg-secondary)', marginLeft: i > 0 ? '-8px' : '0'
-                                    }}>{u.email[0].toUpperCase()}</div>
-                                ))}
-                            </div>
-                        </div>
+                    <Link href="/dashboard" style={{ display: 'flex', alignItems: 'center', color: 'var(--text-muted)', transition: 'color 0.15s' }}
+                        onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
+                        onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}>
+                        <ArrowLeft size={18} />
+                    </Link>
+                    <div style={{ width: '1px', height: '18px', background: 'var(--border)' }} />
+                    <div style={{
+                        width: 28, height: 28, borderRadius: '8px',
+                        background: 'var(--gradient-accent)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    }}>
+                        <GitBranch size={14} color="#fff" />
+                    </div>
+                    <span style={{ fontSize: '15px', fontWeight: 700, color: 'var(--text-primary)' }}>{repo?.name || 'Repository'}</span>
+                    {stagedChanges.length > 0 && (
+                        <span className="badge badge-warning">{stagedChanges.length} unsaved</span>
                     )}
                 </div>
-            </nav>
 
-            <div style={{ maxWidth: '1300px', margin: '0 auto', padding: '20px' }}>
-                <div style={{ display: 'flex', gap: '8px', marginBottom: '20px', borderBottom: '1px solid var(--border)', paddingBottom: '12px' }}>
-                    <button onClick={() => setTab('files')} style={tabStyle('files')}><FileCode size={16} /> Files</button>
-                    <button onClick={() => setTab('history')} style={tabStyle('history')}><Clock size={16} /> History</button>
-                    <button onClick={() => setTab('ai')} style={tabStyle('ai')}><Brain size={16} /> AI Review</button>
-
-                    <div style={{ marginLeft: 'auto', display: 'flex', gap: '8px' }}>
-                        <button className="btn-secondary" onClick={checkIntegrity} disabled={checkingIntegrity} style={{ padding: '7px 14px', fontSize: '13px' }}>
-                            {checkingIntegrity ? <Loader2 size={14} className="animate-spin" /> : <Shield size={14} />} Verify
-                        </button>
-                        <button className="btn-secondary" onClick={handleAIReview} disabled={aiLoading || files.length === 0} style={{ padding: '7px 14px', fontSize: '13px' }}>
-                            <Play size={14} /> Run AI Review
-                        </button>
-                        <button className="btn-primary" onClick={() => setShowUpload(!showUpload)} style={{ padding: '7px 14px', fontSize: '13px' }}>
-                            <Upload size={14} /> Commit
-                        </button>
-                    </div>
-                </div>
-
-                {integrityStatus && (
-                    <div className="fade-in" style={{
-                        padding: '12px 18px', borderRadius: '10px', marginBottom: '16px',
-                        background: integrityStatus.isValid ? '#dcfce7' : '#fee2e2',
-                        border: `1px solid ${integrityStatus.isValid ? '#86efac' : '#fca5a5'}`,
-                        display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '14px'
-                    }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            {integrityStatus.isValid ? <ShieldCheck size={18} color="var(--success)" /> : <ShieldAlert size={18} color="var(--danger)" />}
-                            <span style={{ fontWeight: 600, color: integrityStatus.isValid ? 'var(--success)' : 'var(--danger)' }}>
-                                {integrityStatus.isValid ? 'Chain Verified' : 'Chain Broken — Tampering detected!'}
-                            </span>
-                        </div>
-                        <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{integrityStatus.verifiedCommits}/{integrityStatus.totalCommits} verified</span>
-                    </div>
-                )}
-
-                {showUpload && (
-                    <div className="glass-card fade-in" style={{ padding: '20px', marginBottom: '20px' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '14px' }}>
-                            <h3 style={{ fontSize: '15px', fontWeight: 600 }}>Commit & Push</h3>
-                            <button onClick={() => setShowUpload(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}><X size={16} /></button>
-                        </div>
-                        {stagedChanges.length > 0 && (
-                            <div style={{ marginBottom: '12px' }}>
-                                <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '6px' }}>Staged Changes:</div>
-                                {stagedChanges.map(f => (
-                                    <div key={f.path} style={{
-                                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                                        padding: '6px 10px', borderRadius: '6px', background: '#dcfce7',
-                                        marginBottom: '4px', fontSize: '13px'
-                                    }}>
-                                        <span style={{ color: 'var(--success)', fontWeight: 500 }}>M {f.path}</span>
-                                        <button onClick={() => removeStaged(f.path)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}><Trash2 size={12} /></button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    {/* Online presence */}
+                    {onlineUsers.length > 0 && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '5px 12px', borderRadius: 'var(--radius-full)', background: 'var(--success-bg)', border: '1px solid rgba(22,163,74,.2)' }}>
+                            <div className="presence-dot" />
+                            <span style={{ fontSize: '12px', color: 'var(--success)', fontWeight: 600 }}>{onlineUsers.length} online</span>
+                            <div style={{ display: 'flex', marginLeft: '2px' }}>
+                                {onlineUsers.slice(0, 3).map((u, i) => (
+                                    <div key={i} title={u.email} className="avatar" style={{ marginLeft: i > 0 ? '-8px' : '0', width: 24, height: 24, fontSize: '10px' }}>
+                                        {u.email[0].toUpperCase()}
                                     </div>
                                 ))}
                             </div>
-                        )}
-                        <form onSubmit={handlePush} style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                            <div style={{ display: 'flex', gap: '8px' }}>
-                                <input type="file" multiple onChange={handleFileUpload} style={{ fontSize: '13px', color: 'var(--text-secondary)' }} />
+                        </div>
+                    )}
+
+                    {/* Action buttons */}
+                    <button className="btn-ghost" onClick={checkIntegrity} disabled={checkingIntegrity} style={{ padding: '7px 14px', fontSize: '13px' }}>
+                        {checkingIntegrity ? <Loader2 size={14} className="animate-spin" /> : <Shield size={14} />} Verify
+                    </button>
+                    <button className="btn-ghost" onClick={handleAIReview} disabled={aiLoading || files.length === 0} style={{ padding: '7px 14px', fontSize: '13px' }}>
+                        <Sparkles size={14} /> AI Review
+                    </button>
+                    <button className="btn-primary" onClick={() => setShowUpload(!showUpload)} style={{ padding: '7px 16px', fontSize: '13px' }}>
+                        <Upload size={14} /> Commit
+                    </button>
+                </div>
+            </nav>
+
+            {/* Integrity banner */}
+            {integrityStatus && (
+                <div className="fade-in" style={{
+                    padding: '12px 28px', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                    background: integrityStatus.isValid ? 'var(--success-bg)' : 'var(--danger-bg)',
+                    borderBottom: `1px solid ${integrityStatus.isValid ? 'rgba(22,163,74,.2)' : 'rgba(220,38,38,.2)'}`,
+                    fontSize: '14px'
+                }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        {integrityStatus.isValid
+                            ? <ShieldCheck size={18} color="var(--success)" />
+                            : <ShieldAlert size={18} color="var(--danger)" />}
+                        <span style={{ fontWeight: 600, color: integrityStatus.isValid ? 'var(--success)' : 'var(--danger)' }}>
+                            {integrityStatus.isValid ? 'All commits verified — blockchain chain intact' : 'Chain Broken — Potential tampering detected!'}
+                        </span>
+                    </div>
+                    <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+                        {integrityStatus.verifiedCommits}/{integrityStatus.totalCommits} verified
+                    </span>
+                </div>
+            )}
+
+            {/* Commit panel */}
+            {showUpload && (
+                <div className="fade-in" style={{
+                    margin: '16px 28px 0',
+                    background: 'var(--bg-card)',
+                    border: '1px solid var(--border)',
+                    borderRadius: 'var(--radius-lg)',
+                    overflow: 'hidden',
+                    boxShadow: 'var(--shadow-md)'
+                }}>
+                    <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'var(--bg-hover)' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <GitCommit size={16} color="var(--accent)" />
+                            <h3 style={{ fontSize: '14px', fontWeight: 700 }}>Commit & Push</h3>
+                        </div>
+                        <button onClick={() => setShowUpload(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex' }}>
+                            <X size={16} />
+                        </button>
+                    </div>
+                    <div style={{ padding: '16px 20px' }}>
+                        {stagedChanges.length > 0 && (
+                            <div style={{ marginBottom: '12px' }}>
+                                <div style={{ fontSize: '12px', fontWeight: 700, color: 'var(--text-muted)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Staged Changes</div>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                    {stagedChanges.map(f => (
+                                        <div key={f.path} style={{
+                                            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                                            padding: '7px 12px', borderRadius: 'var(--radius-sm)', background: 'var(--success-bg)',
+                                            border: '1px solid rgba(22,163,74,.15)'
+                                        }}>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                                <Check size={12} color="var(--success)" />
+                                                <span style={{ color: 'var(--success)', fontWeight: 600, fontSize: '13px', fontFamily: 'JetBrains Mono, monospace' }}>{f.path}</span>
+                                            </div>
+                                            <button onClick={() => removeStaged(f.path)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex' }}>
+                                                <Trash2 size={12} />
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
                             </div>
-                            <input className="input-field" placeholder="Commit message (e.g. 'Fix login bug')" value={commitMsg}
-                                onChange={e => setCommitMsg(e.target.value)} style={{ fontSize: '13px' }} />
-                            <button className="btn-primary" type="submit" disabled={pushing || stagedChanges.length === 0} style={{ fontSize: '13px' }}>
-                                {pushing ? <Loader2 size={14} className="animate-spin" /> : <><GitCommit size={14} /> Commit {stagedChanges.length} file(s)</>}
+                        )}
+                        <form onSubmit={handlePush} style={{ display: 'flex', gap: '10px', alignItems: 'flex-end' }}>
+                            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                <input type="file" multiple onChange={handleFileUpload} style={{ fontSize: '13px', color: 'var(--text-secondary)' }} />
+                                <input className="input-field" placeholder="Commit message (e.g. 'Fix login bug')" value={commitMsg}
+                                    onChange={e => setCommitMsg(e.target.value)} style={{ fontSize: '13px' }} />
+                            </div>
+                            <button className="btn-primary" type="submit" disabled={pushing || stagedChanges.length === 0} style={{ padding: '11px 20px', fontSize: '13px', whiteSpace: 'nowrap' }}>
+                                {pushing ? <Loader2 size={14} className="animate-spin" /> : <><GitCommit size={14} /> Commit {stagedChanges.length} file{stagedChanges.length !== 1 ? 's' : ''}</>}
                             </button>
                         </form>
                     </div>
-                )}
+                </div>
+            )}
 
+            {/* Main IDE area */}
+            <div style={{ padding: '16px 28px 28px' }}>
+                {/* Tab bar */}
+                <div style={{ display: 'flex', alignItems: 'center', marginBottom: '16px' }}>
+                    <div className="tab-bar">
+                        {(
+                            [
+                                { key: 'files' as const, label: 'Files', icon: FileCode, count: undefined },
+                                { key: 'history' as const, label: 'History', icon: Clock, count: commits.length },
+                                { key: 'ai' as const, label: 'AI Review', icon: Brain, count: undefined },
+                            ]
+                        ).map(t => (
+                            <button key={t.key} className={`tab-btn ${tab === t.key ? 'active' : ''}`}
+                                onClick={() => setTab(t.key)}>
+                                <t.icon size={14} />
+                                {t.label}
+                                {t.count !== undefined && t.count > 0 && (
+                                    <span style={{
+                                        fontSize: '10px', fontWeight: 700, padding: '1px 6px',
+                                        borderRadius: 'var(--radius-full)',
+                                        background: tab === t.key ? 'rgba(99,102,241,.15)' : 'var(--border)',
+                                        color: tab === t.key ? 'var(--accent)' : 'var(--text-muted)'
+                                    }}>{t.count}</span>
+                                )}
+                            </button>
+                        ))}
+                    </div>
+                </div>
+
+                {/* FILES TAB */}
                 {tab === 'files' && (
                     <div className="fade-in">
+                        {/* Hidden file input — always mounted so ref works from empty state and file tree */}
+                        <input
+                            ref={fileInputRef}
+                            type="file"
+                            multiple
+                            onChange={handleFileUpload}
+                            style={{ display: 'none' }}
+                        />
+                        {/* Time-travel slider */}
                         {commits.length > 1 && (
-                            <div className="glass-card" style={{ padding: '16px 20px', marginBottom: '20px' }}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
-                                    <Clock size={16} color="var(--warning)" />
-                                    <span style={{ fontWeight: 600, fontSize: '14px' }}>Time-Travel</span>
-                                    <span className="badge badge-warning">Commit {sliderValue + 1}/{commits.length}</span>
+                            <div style={{
+                                background: 'var(--bg-card)', border: '1px solid var(--border)',
+                                borderRadius: 'var(--radius)', padding: '14px 18px', marginBottom: '16px',
+                                boxShadow: 'var(--shadow-xs)'
+                            }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+                                    <Clock size={14} color="var(--warning)" />
+                                    <span style={{ fontWeight: 600, fontSize: '13px', color: 'var(--text-primary)' }}>Time-Travel</span>
+                                    <span className="badge badge-warning" style={{ fontSize: '10px' }}>Commit {sliderValue + 1}/{commits.length}</span>
+                                    <span style={{ fontSize: '12px', color: 'var(--accent)', fontWeight: 500, marginLeft: 'auto' }}>
+                                        {commits[commits.length - 1 - sliderValue]?.message}
+                                    </span>
                                 </div>
                                 <input type="range" min={0} max={commits.length - 1} value={sliderValue}
                                     onChange={e => handleSliderChange(Number(e.target.value))}
-                                    style={{ width: '100%', accentColor: 'var(--accent)' }} />
-                                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                                    <span>Oldest</span>
-                                    <span style={{ color: 'var(--accent)', fontWeight: 500, fontSize: '12px' }}>{commits[commits.length - 1 - sliderValue]?.message}</span>
-                                    <span>Latest</span>
+                                    style={{ width: '100%', accentColor: 'var(--accent)', cursor: 'pointer' }} />
+                                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                                    <span>Oldest</span><span>Latest</span>
                                 </div>
                             </div>
                         )}
 
                         {activeSliderFiles.length === 0 ? (
-                            <div className="glass-card" style={{ textAlign: 'center', padding: '60px 20px' }}>
-                                <div style={{ width: 56, height: 56, borderRadius: '14px', background: 'var(--accent-light)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-                                    <FileCode size={28} color="var(--accent)" />
+                            <div style={{
+                                background: 'var(--bg-card)', border: '1px solid var(--border)',
+                                borderRadius: 'var(--radius-lg)', padding: '80px 20px', textAlign: 'center',
+                                boxShadow: 'var(--shadow-sm)'
+                            }}>
+                                <div style={{ width: 64, height: 64, borderRadius: '18px', background: 'var(--accent-light)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 20px', boxShadow: '0 4px 16px rgba(99,102,241,.1)' }}>
+                                    <FileCode size={30} color="var(--accent)" />
                                 </div>
-                                <h3 style={{ fontSize: '18px', fontWeight: 700, marginBottom: '8px' }}>Start coding</h3>
-                                <p style={{ color: 'var(--text-secondary)', fontSize: '14px', maxWidth: '420px', margin: '0 auto 20px' }}>
-                                    Create a new file or upload existing ones. After editing, the AI will review your code for bugs, security issues, and suggest improvements.
+                                <h3 style={{ fontSize: '20px', fontWeight: 700, marginBottom: '10px' }}>Start coding</h3>
+                                <p style={{ color: 'var(--text-secondary)', fontSize: '14px', maxWidth: '380px', margin: '0 auto 24px', lineHeight: 1.7 }}>
+                                    Create a new file or upload existing ones. After editing, AI will review your code for bugs and improvements.
                                 </p>
                                 <div style={{ display: 'flex', gap: '10px', justifyContent: 'center' }}>
-                                    <button className="btn-primary" onClick={() => setShowNewFile(true)}><Plus size={16} /> New File</button>
-                                    <button className="btn-secondary" onClick={() => setShowUpload(true)}><Upload size={16} /> Upload Files</button>
+                                    <button className="btn-primary" onClick={() => setShowNewFile(true)}><Plus size={15} /> New File</button>
+                                    <button className="btn-secondary" onClick={() => fileInputRef.current?.click()}><Upload size={15} /> Upload Files</button>
                                 </div>
                             </div>
                         ) : (
-                            <div style={{ display: 'grid', gridTemplateColumns: '240px 1fr', gap: '16px' }}>
-                                <div className="glass-card" style={{ padding: '10px', alignSelf: 'flex-start' }}>
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 10px', marginBottom: '4px' }}>
-                                        <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Files</span>
-                                        <button onClick={() => setShowNewFile(true)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--accent)' }} title="New file"><Plus size={16} /></button>
+                            <div style={{ display: 'grid', gridTemplateColumns: '220px 1fr', gap: '12px' }}>
+                                {/* File tree */}
+                                <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '8px', alignSelf: 'flex-start', boxShadow: 'var(--shadow-xs)' }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 8px', marginBottom: '4px' }}>
+                                        <span style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Files</span>
+                                        <div style={{ display: 'flex', gap: '2px' }}>
+                                            <button onClick={() => fileInputRef.current?.click()} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', padding: '4px', borderRadius: '5px', transition: 'all 0.15s' }} title="Upload files from device"
+                                                onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-hover)'; e.currentTarget.style.color = 'var(--accent)'; }}
+                                                onMouseLeave={e => { e.currentTarget.style.background = 'none'; e.currentTarget.style.color = 'var(--text-muted)'; }}>
+                                                <FolderOpen size={14} />
+                                            </button>
+                                            <button onClick={() => setShowNewFile(true)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex', padding: '4px', borderRadius: '5px', transition: 'all 0.15s' }} title="New file"
+                                                onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-hover)'; e.currentTarget.style.color = 'var(--accent)'; }}
+                                                onMouseLeave={e => { e.currentTarget.style.background = 'none'; e.currentTarget.style.color = 'var(--text-muted)'; }}>
+                                                <Plus size={14} />
+                                            </button>
+                                        </div>
                                     </div>
                                     {activeSliderFiles.map(file => (
-                                        <button key={file.id || file.path} onClick={() => { setSelectedFile(file); setEditMode(false); setAiExplanation('') }} style={{
-                                            display: 'flex', alignItems: 'center', gap: '8px',
-                                            padding: '8px 10px', borderRadius: '6px', border: 'none', cursor: 'pointer',
-                                            background: selectedFile?.path === file.path ? 'var(--accent-light)' : 'transparent',
-                                            color: selectedFile?.path === file.path ? 'var(--accent)' : 'var(--text-secondary)',
-                                            fontSize: '13px', textAlign: 'left' as const, width: '100%', transition: 'all 0.15s',
-                                            fontWeight: selectedFile?.path === file.path ? 600 : 400
-                                        }}>
-                                            <FileCode size={13} />
+                                        <button key={file.id || file.path}
+                                            onClick={() => { setSelectedFile(file); setEditMode(false); setAiExplanation('') }}
+                                            style={{
+                                                display: 'flex', alignItems: 'center', gap: '7px',
+                                                padding: '7px 8px', borderRadius: 'var(--radius-sm)', border: 'none', cursor: 'pointer',
+                                                background: selectedFile?.path === file.path ? 'var(--accent-light)' : 'transparent',
+                                                color: selectedFile?.path === file.path ? 'var(--accent)' : 'var(--text-secondary)',
+                                                fontSize: '13px', textAlign: 'left' as const, width: '100%', transition: 'all 0.15s',
+                                                fontWeight: selectedFile?.path === file.path ? 600 : 400,
+                                                fontFamily: 'JetBrains Mono, monospace'
+                                            }}>
+                                            <FileCode size={12} />
                                             <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{file.path}</span>
                                             {stagedChanges.find(s => s.path === file.path) && (
-                                                <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--success)', flexShrink: 0 }} />
+                                                <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--warning)', flexShrink: 0 }} />
                                             )}
                                         </button>
                                     ))}
                                 </div>
 
-                                <div className="glass-card" style={{ padding: '20px' }}>
+                                {/* Editor panel */}
+                                <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '0', overflow: 'hidden', boxShadow: 'var(--shadow-xs)' }}>
                                     {selectedFile ? (
-                                        <div>
-                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                                        <>
+                                            {/* Editor header */}
+                                            <div style={{
+                                                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                                                padding: '10px 16px', borderBottom: '1px solid var(--border)',
+                                                background: 'var(--bg-hover)'
+                                            }}>
                                                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                                    <FileCode size={16} color="var(--accent)" />
-                                                    <span style={{ fontWeight: 600, fontSize: '14px' }}>{selectedFile.path}</span>
+                                                    <FileCode size={14} color="var(--accent)" />
+                                                    <span style={{ fontWeight: 600, fontSize: '13px', fontFamily: 'JetBrains Mono, monospace' }}>{selectedFile.path}</span>
                                                     {stagedChanges.find(s => s.path === selectedFile.path) && (
-                                                        <span className="badge badge-success" style={{ fontSize: '10px' }}>Modified</span>
+                                                        <span className="badge badge-warning" style={{ fontSize: '10px' }}>Modified</span>
                                                     )}
                                                 </div>
                                                 <div style={{ display: 'flex', gap: '6px' }}>
                                                     {editMode ? (
                                                         <>
-                                                            <button className="btn-primary" onClick={stageEdit} style={{ padding: '5px 12px', fontSize: '12px' }}><Save size={12} /> Save</button>
-                                                            <button className="btn-secondary" onClick={() => setEditMode(false)} style={{ padding: '5px 12px', fontSize: '12px' }}>Cancel</button>
+                                                            <button className="btn-primary" onClick={stageEdit} style={{ padding: '5px 12px', fontSize: '12px', borderRadius: 'var(--radius-sm)' }}>
+                                                                <Save size={12} /> Save
+                                                            </button>
+                                                            <button className="btn-secondary" onClick={() => setEditMode(false)} style={{ padding: '5px 12px', fontSize: '12px', borderRadius: 'var(--radius-sm)' }}>Cancel</button>
                                                         </>
                                                     ) : (
                                                         <>
-                                                            <button className="btn-secondary" onClick={() => { setEditMode(true); setEditContent(selectedFile.content || '') }} style={{ padding: '5px 12px', fontSize: '12px' }}><Edit3 size={12} /> Edit</button>
-                                                            <button className="btn-secondary" onClick={() => handleAIExplain(selectedFile)} disabled={aiLoading} style={{ padding: '5px 12px', fontSize: '12px' }}>{aiLoading ? <Loader2 size={12} className="animate-spin" /> : <><Sparkles size={12} /> Explain</>}</button>
+                                                            <button className="btn-ghost" onClick={() => { setEditMode(true); setEditContent(selectedFile.content || '') }} style={{ padding: '5px 12px', fontSize: '12px' }}>
+                                                                <Edit3 size={12} /> Edit
+                                                            </button>
+                                                            <button className="btn-ghost" onClick={() => handleAIExplain(selectedFile)} disabled={aiLoading} style={{ padding: '5px 12px', fontSize: '12px' }}>
+                                                                {aiLoading ? <Loader2 size={12} className="animate-spin" /> : <><Sparkles size={12} /> Explain</>}
+                                                            </button>
                                                         </>
                                                     )}
                                                 </div>
                                             </div>
+
+                                            {/* AI explanation */}
                                             {aiExplanation && (
                                                 <div className="fade-in" style={{
-                                                    padding: '14px', borderRadius: '10px', marginBottom: '12px',
-                                                    background: 'var(--accent-light)', border: '1px solid #c4b5fd',
-                                                    fontSize: '13px', lineHeight: 1.7, color: 'var(--text-secondary)'
+                                                    padding: '14px 18px', borderBottom: '1px solid var(--border)',
+                                                    background: 'var(--accent-light)', fontSize: '13px', lineHeight: 1.7, color: 'var(--text-secondary)'
                                                 }}>
-                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px', color: 'var(--accent)', fontWeight: 600, fontSize: '13px' }}>
-                                                        <Brain size={14} /> AI Explanation
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px', color: 'var(--accent)', fontWeight: 700, fontSize: '12px' }}>
+                                                        <Brain size={13} /> AI EXPLANATION
                                                     </div>
                                                     {aiExplanation}
                                                 </div>
                                             )}
-                                            {editMode ? (
-                                                <textarea value={editContent} onChange={e => setEditContent(e.target.value)} style={{
-                                                    width: '100%', minHeight: '400px', padding: '16px', borderRadius: '10px',
-                                                    border: '2px solid var(--accent)', background: '#fafbff',
-                                                    fontFamily: "'JetBrains Mono', 'Fira Code', monospace", fontSize: '13px',
-                                                    lineHeight: 1.6, resize: 'vertical', outline: 'none', color: 'var(--text-primary)'
-                                                }} />
-                                            ) : (
-                                                <div className="code-block" style={{ minHeight: '200px' }}>{selectedFile.content || 'Empty file'}</div>
-                                            )}
-                                        </div>
+
+                                            {/* Code area */}
+                                            <div style={{ padding: '16px' }}>
+                                                {editMode ? (
+                                                    <textarea value={editContent} onChange={e => setEditContent(e.target.value)} style={{
+                                                        width: '100%', minHeight: '400px', padding: '16px', borderRadius: 'var(--radius)',
+                                                        border: '2px solid var(--accent)', background: '#1E1E2E', color: '#CDD6F4',
+                                                        fontFamily: "'JetBrains Mono', monospace", fontSize: '13px',
+                                                        lineHeight: 1.7, resize: 'vertical', outline: 'none'
+                                                    }} />
+                                                ) : (
+                                                    <div className="code-block" style={{ minHeight: '300px' }}>{selectedFile.content || '// Empty file'}</div>
+                                                )}
+                                            </div>
+                                        </>
                                     ) : (
-                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '300px', color: 'var(--text-muted)', fontSize: '14px' }}>
-                                            Select a file to view and edit
+                                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '360px', gap: '10px' }}>
+                                            <FileCode size={32} color="var(--border)" />
+                                            <p style={{ color: 'var(--text-muted)', fontSize: '14px' }}>Select a file to view and edit</p>
                                         </div>
                                     )}
-                                </div>
-                            </div>
-                        )}
-
-                        {showNewFile && (
-                            <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200 }}>
-                                <div style={{ background: 'var(--bg-card)', borderRadius: '14px', padding: '28px', width: '520px', border: '1px solid var(--border)', boxShadow: 'var(--shadow-lg)' }}>
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '16px' }}>
-                                        <h3 style={{ fontWeight: 600 }}>Create New File</h3>
-                                        <button onClick={() => setShowNewFile(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}><X size={18} /></button>
-                                    </div>
-                                    <input className="input-field" placeholder="File name (e.g. main.py, index.js)" value={newFileName}
-                                        onChange={e => setNewFileName(e.target.value)} style={{ marginBottom: '12px' }} />
-                                    <textarea value={newFileContent} onChange={e => setNewFileContent(e.target.value)} placeholder="Write your code here..." style={{
-                                        width: '100%', minHeight: '250px', padding: '14px', borderRadius: '10px',
-                                        border: '1px solid var(--border)', background: '#fafbff',
-                                        fontFamily: "'JetBrains Mono', 'Fira Code', monospace", fontSize: '13px',
-                                        lineHeight: 1.6, resize: 'vertical', outline: 'none', color: 'var(--text-primary)'
-                                    }} />
-                                    <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
-                                        <button className="btn-primary" onClick={addNewFile} disabled={!newFileName.trim()}>
-                                            <Plus size={14} /> Create File
-                                        </button>
-                                        <button className="btn-secondary" onClick={() => setShowNewFile(false)}>Cancel</button>
-                                    </div>
                                 </div>
                             </div>
                         )}
                     </div>
                 )}
 
+                {/* HISTORY TAB */}
                 {tab === 'history' && (
                     <div className="fade-in">
                         {commits.length === 0 ? (
-                            <div className="glass-card" style={{ textAlign: 'center', padding: '60px 20px' }}>
-                                <GitCommit size={36} style={{ margin: '0 auto 12px', color: 'var(--text-muted)', opacity: 0.4 }} />
-                                <p style={{ color: 'var(--text-muted)' }}>No commits yet. Create files and push them.</p>
+                            <div style={{
+                                background: 'var(--bg-card)', border: '1px solid var(--border)',
+                                borderRadius: 'var(--radius-lg)', padding: '80px 20px', textAlign: 'center'
+                            }}>
+                                <GitCommit size={36} color="var(--border)" style={{ margin: '0 auto 14px' }} />
+                                <p style={{ color: 'var(--text-muted)', fontSize: '14px' }}>No commits yet. Create files and push them.</p>
                             </div>
                         ) : (
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                            <div style={{ maxWidth: '760px' }}>
                                 {commits.map((commit, i) => (
-                                    <div key={commit.id} className="glass-card" style={{ padding: '18px' }}>
-                                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                                            <div style={{ flex: 1 }}>
-                                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-                                                    <GitCommit size={14} color="var(--accent)" />
-                                                    <span style={{ fontWeight: 600, fontSize: '14px' }}>{commit.message}</span>
-                                                    {i === 0 && <span className="badge badge-success">HEAD</span>}
-                                                </div>
-                                                {commit.ai_summary && (
-                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px', fontSize: '12px', color: 'var(--accent)' }}>
-                                                        <Brain size={11} /> {commit.ai_summary}
-                                                    </div>
-                                                )}
-                                                <div style={{ display: 'flex', gap: '14px', fontSize: '11px', color: 'var(--text-muted)' }}>
-                                                    <span>{commit.author_email || 'Unknown'}</span>
-                                                    <span>{new Date(commit.created_at).toLocaleString()}</span>
-                                                    <span style={{ fontFamily: 'monospace' }}>#{commit.integrity_hash?.slice(0, 8)}</span>
-                                                </div>
-                                            </div>
-                                            {i > 0 && (
-                                                <button className="btn-secondary" onClick={() => handleRollback(commit.id)} style={{ padding: '5px 10px', fontSize: '11px' }}>
-                                                    <RotateCcw size={12} /> Rollback
-                                                </button>
+                                    <div key={commit.id} style={{ display: 'flex', gap: '16px', marginBottom: '4px' }}>
+                                        {/* Timeline line + dot */}
+                                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', paddingTop: '20px' }}>
+                                            <div style={{
+                                                width: 12, height: 12, borderRadius: '50%', flexShrink: 0,
+                                                background: i === 0 ? 'var(--gradient-accent)' : 'var(--border-hover)',
+                                                border: `2px solid ${i === 0 ? 'var(--accent)' : 'var(--border)'}`,
+                                                boxShadow: i === 0 ? 'var(--shadow-accent)' : 'none'
+                                            }} />
+                                            {i < commits.length - 1 && (
+                                                <div style={{ width: 2, flex: 1, background: 'var(--border)', marginTop: '4px' }} />
                                             )}
+                                        </div>
+
+                                        {/* Commit card */}
+                                        <div style={{
+                                            flex: 1, background: 'var(--bg-card)', border: '1px solid var(--border)',
+                                            borderRadius: 'var(--radius)', padding: '14px 18px', marginBottom: '8px',
+                                            boxShadow: 'var(--shadow-xs)',
+                                        }}>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                                                <div style={{ flex: 1 }}>
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                                                        <span style={{ fontWeight: 700, fontSize: '14px', color: 'var(--text-primary)' }}>{commit.message}</span>
+                                                        {i === 0 && <span className="badge badge-success" style={{ fontSize: '10px' }}>HEAD</span>}
+                                                    </div>
+                                                    {commit.ai_summary && (
+                                                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px', fontSize: '12px', color: 'var(--accent)' }}>
+                                                            <Brain size={11} /> {commit.ai_summary}
+                                                        </div>
+                                                    )}
+                                                    <div style={{ display: 'flex', gap: '16px', fontSize: '12px', color: 'var(--text-muted)', flexWrap: 'wrap' }}>
+                                                        <span>{commit.author_email || 'Unknown'}</span>
+                                                        <span>{new Date(commit.created_at).toLocaleString()}</span>
+                                                        <span style={{ fontFamily: 'JetBrains Mono, monospace', color: 'var(--accent)' }}>#{commit.integrity_hash?.slice(0, 8)}</span>
+                                                    </div>
+                                                </div>
+                                                {i > 0 && (
+                                                    <button className="btn-ghost" onClick={() => handleRollback(commit.id)} style={{ padding: '5px 10px', fontSize: '12px', flexShrink: 0, marginLeft: '12px' }}>
+                                                        <RotateCcw size={12} /> Rollback
+                                                    </button>
+                                                )}
+                                            </div>
                                         </div>
                                     </div>
                                 ))}
@@ -572,110 +755,189 @@ export default function RepoPage() {
                     </div>
                 )}
 
+                {/* AI TAB */}
                 {tab === 'ai' && (
                     <div className="fade-in" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
-                        <div className="glass-card" style={{ padding: '20px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '14px' }}>
-                                <Brain size={18} color="var(--accent)" />
-                                <h3 style={{ fontWeight: 700, fontSize: '16px' }}>Code Review</h3>
+                        {/* Live AI Mentor Dashboard */}
+                        <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', boxShadow: 'var(--shadow-sm)', display: 'flex', flexDirection: 'column', height: '580px' }}>
+                            <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: '8px', background: 'var(--bg-hover)' }}>
+                                <div style={{ width: 28, height: 28, borderRadius: '8px', background: 'var(--accent-light)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 10px var(--accent-glow)' }}>
+                                    <Brain size={15} color="var(--accent)" />
+                                </div>
+                                <h3 style={{ fontWeight: 700, fontSize: '15px', color: 'var(--text-primary)' }}>Live AI Mentor Dashboard</h3>
+                                <div style={{ marginLeft: 'auto', display: 'flex', gap: '6px', alignItems: 'center', fontSize: '11px', color: 'var(--accent)', background: 'var(--accent-light)', padding: '4px 8px', borderRadius: '12px', fontWeight: 600 }}>
+                                    <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent)', animation: 'pulse 2s infinite' }} />
+                                    Polling DynamoDB
+                                </div>
                             </div>
-                            {!aiReview && !aiLoading && (
-                                <div style={{ textAlign: 'center', padding: '40px 16px' }}>
-                                    <Sparkles size={32} color="var(--accent)" style={{ margin: '0 auto 12px', opacity: 0.5 }} />
-                                    <p style={{ color: 'var(--text-secondary)', fontSize: '14px', marginBottom: '16px' }}>
-                                        AI will analyze your code for bugs, security issues, and improvements.
-                                    </p>
-                                    <button className="btn-primary" onClick={handleAIReview} disabled={files.length === 0}>
-                                        <Play size={14} /> Run Review
-                                    </button>
-                                </div>
-                            )}
-                            {aiLoading && !aiReview && (
-                                <div style={{ textAlign: 'center', padding: '40px' }}>
-                                    <Loader2 size={24} className="animate-spin" color="var(--accent)" />
-                                    <p style={{ color: 'var(--text-muted)', marginTop: '10px', fontSize: '13px' }}>Analyzing your code...</p>
-                                </div>
-                            )}
-                            {aiReview && (
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                                    <div style={{ padding: '12px', borderRadius: '8px', background: 'var(--bg-hover)', border: '1px solid var(--border)' }}>
-                                        <div style={{ fontWeight: 600, marginBottom: '4px', fontSize: '13px' }}>Summary</div>
-                                        <p style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.6 }}>{aiReview.summary}</p>
+                            
+                            <div style={{ padding: '20px', flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                                {mentorAnalytics.length === 0 ? (
+                                    <div style={{ textAlign: 'center', padding: '60px 16px' }}>
+                                        <div style={{ width: 56, height: 56, borderRadius: '16px', background: 'var(--bg-hover)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px', border: '1px dashed var(--border-strong)' }}>
+                                            <Sparkles size={26} color="var(--text-muted)" />
+                                        </div>
+                                        <h4 style={{ fontWeight: 700, marginBottom: '8px', color: 'var(--text-primary)' }}>Awaiting Mentor Reviews</h4>
+                                        <p style={{ color: 'var(--text-secondary)', fontSize: '13px', lineHeight: 1.7 }}>
+                                            Push a commit and run your <b>SQS Background Worker</b> to see real-time AI mentoring feedback streaming here via DynamoDB!
+                                        </p>
                                     </div>
-                                    {aiReview.bugs.length > 0 && (
-                                        <div style={{ padding: '12px', borderRadius: '8px', background: '#fef2f2', border: '1px solid #fca5a5' }}>
-                                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, color: 'var(--danger)', marginBottom: '6px', fontSize: '13px' }}>
-                                                <Bug size={13} /> Bugs Found
-                                            </div>
-                                            {aiReview.bugs.map((b, i) => (
-                                                <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '4px' }}>
-                                                    <p style={{ fontSize: '12px', color: 'var(--text-secondary)', flex: 1 }}>• {b}</p>
-                                                    <button onClick={() => handleAIFix(b)} style={{ fontSize: '11px', color: 'var(--accent)', background: 'none', border: 'none', cursor: 'pointer', whiteSpace: 'nowrap', fontWeight: 600 }}>Fix →</button>
+                                ) : (
+                                    mentorAnalytics.map((analytic, idx) => (
+                                        <div key={idx} style={{ padding: '16px', borderRadius: 'var(--radius)', background: 'var(--bg-hover)', border: `1px solid ${analytic.criticalBug ? 'rgba(220,38,38,0.3)' : 'var(--border)'}`, position: 'relative', overflow: 'hidden' }}>
+                                            {/* Readability Score Gauge */}
+                                            <div style={{ position: 'absolute', top: 0, left: 0, bottom: 0, width: '4px', background: analytic.readabilityScore > 80 ? '#10b981' : analytic.readabilityScore > 50 ? '#f59e0b' : '#ef4444' }} />
+                                            
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
+                                                <div>
+                                                    <div style={{ fontWeight: 700, fontSize: '14px', color: 'var(--text-primary)' }}>Commit #{analytic.commitId.substring(0,6)}</div>
+                                                    <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>{new Date(analytic.timestamp).toLocaleString()}</div>
                                                 </div>
-                                            ))}
-                                        </div>
-                                    )}
-                                    {aiReview.suggestions.length > 0 && (
-                                        <div style={{ padding: '12px', borderRadius: '8px', background: '#eff6ff', border: '1px solid #93c5fd' }}>
-                                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, color: 'var(--info)', marginBottom: '6px', fontSize: '13px' }}>
-                                                <Lightbulb size={13} /> Suggestions
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '20px', fontWeight: 800, color: analytic.readabilityScore > 80 ? '#10b981' : analytic.readabilityScore > 50 ? '#f59e0b' : '#ef4444' }}>
+                                                    {analytic.readabilityScore} <span style={{ fontSize: '12px', color: 'var(--text-muted)', fontWeight: 600 }}>/ 100</span>
+                                                </div>
                                             </div>
-                                            {aiReview.suggestions.map((s, i) => <p key={i} style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '3px' }}>• {s}</p>)}
-                                        </div>
-                                    )}
-                                    {aiReview.security.length > 0 && (
-                                        <div style={{ padding: '12px', borderRadius: '8px', background: '#fffbeb', border: '1px solid #fcd34d' }}>
-                                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, color: 'var(--warning)', marginBottom: '6px', fontSize: '13px' }}>
-                                                <AlertTriangle size={13} /> Security Issues
+                                            
+                                            {analytic.criticalBug && (
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: 'var(--danger)', fontWeight: 700, marginBottom: '12px', background: 'var(--danger-bg)', padding: '6px 10px', borderRadius: '6px' }}>
+                                                    <AlertTriangle size={14} /> SNS Alert Dispatched: Critical Bug Detected!
+                                                </div>
+                                            )}
+
+                                            <div style={{ fontSize: '13px', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                                                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>Mentor says: </span>
+                                                {analytic.mentorFeedback}
                                             </div>
-                                            {aiReview.security.map((s, i) => <p key={i} style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '3px' }}>• {s}</p>)}
                                         </div>
-                                    )}
-                                </div>
-                            )}
+                                    ))
+                                )}
+                            </div>
                         </div>
 
-                        <div className="glass-card" style={{ padding: '20px', display: 'flex', flexDirection: 'column', height: '560px' }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
-                                <MessageSquare size={18} color="var(--info)" />
-                                <h3 style={{ fontWeight: 700, fontSize: '16px' }}>AI Assistant</h3>
+                        {/* AI Chat panel */}
+                        <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', display: 'flex', flexDirection: 'column', height: '580px', boxShadow: 'var(--shadow-sm)' }}>
+                            <div style={{ padding: '16px 20px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: '8px', background: 'var(--bg-hover)' }}>
+                                <div style={{ width: 28, height: 28, borderRadius: '8px', background: 'var(--info-bg)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                    <MessageSquare size={15} color="var(--info)" />
+                                </div>
+                                <h3 style={{ fontWeight: 700, fontSize: '15px' }}>AI Assistant</h3>
+                                {aiLoading && <Loader2 size={14} className="animate-spin" color="var(--accent)" style={{ marginLeft: 'auto' }} />}
                             </div>
-                            <div style={{
-                                flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '10px',
-                                padding: '14px', background: 'var(--bg-hover)', borderRadius: '10px',
-                                border: '1px solid var(--border)', marginBottom: '10px'
-                            }}>
+
+                            <div style={{ flex: 1, overflowY: 'auto', padding: '16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                                 {chatMessages.length === 0 && (
-                                    <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '13px', margin: 'auto', lineHeight: 1.8 }}>
-                                        💬 Ask me anything about your code:<br />
-                                        &quot;How does this function work?&quot;<br />
-                                        &quot;Why is my loop not terminating?&quot;<br />
-                                        &quot;Add error handling to this API&quot;
+                                    <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '13px', margin: 'auto', lineHeight: 1.9 }}>
+                                        <MessageSquare size={28} color="var(--border)" style={{ margin: '0 auto 12px' }} />
+                                        Ask me anything about your code:<br />
+                                        <span style={{ color: 'var(--accent)' }}>"How does this function work?"</span><br />
+                                        <span style={{ color: 'var(--accent)' }}>"Why is my loop not terminating?"</span><br />
+                                        <span style={{ color: 'var(--accent)' }}>"Add error handling to this API"</span>
                                     </div>
                                 )}
                                 {chatMessages.map((msg, i) => (
                                     <div key={i} style={{
-                                        alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
-                                        maxWidth: '85%', padding: '10px 14px', borderRadius: '12px',
-                                        background: msg.role === 'user' ? 'var(--accent)' : 'var(--bg-secondary)',
-                                        color: msg.role === 'user' ? 'white' : 'var(--text-primary)',
-                                        fontSize: '13px', lineHeight: 1.6, whiteSpace: 'pre-wrap',
-                                        border: msg.role === 'ai' ? '1px solid var(--border)' : 'none'
-                                    }}>{msg.text}</div>
+                                        display: 'flex', gap: '8px', flexDirection: msg.role === 'user' ? 'row-reverse' : 'row',
+                                        alignItems: 'flex-end'
+                                    }}>
+                                        <div style={{
+                                            width: 26, height: 26, borderRadius: '50%', flexShrink: 0,
+                                            background: msg.role === 'user' ? 'var(--gradient-accent)' : 'var(--info-bg)',
+                                            display: 'flex', alignItems: 'center', justifyContent: 'center'
+                                        }}>
+                                            {msg.role === 'user'
+                                                ? <span style={{ fontSize: '11px', fontWeight: 700, color: '#fff' }}>{user?.email?.[0]?.toUpperCase()}</span>
+                                                : <Brain size={13} color="var(--info)" />
+                                            }
+                                        </div>
+                                        <div style={{
+                                            maxWidth: '80%', padding: '10px 14px', borderRadius: msg.role === 'user' ? '14px 14px 4px 14px' : '14px 14px 14px 4px',
+                                            background: msg.role === 'user' ? 'var(--gradient-accent)' : 'var(--bg-hover)',
+                                            color: msg.role === 'user' ? 'white' : 'var(--text-primary)',
+                                            fontSize: '13px', lineHeight: 1.6, whiteSpace: 'pre-wrap',
+                                            border: msg.role === 'ai' ? '1px solid var(--border)' : 'none',
+                                            boxShadow: msg.role === 'user' ? 'var(--shadow-accent)' : 'var(--shadow-xs)'
+                                        }}>
+                                            {msg.text}
+                                            {msg.fixData && (
+                                                <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+                                                    <button onClick={() => applyFix(i)} style={{
+                                                        padding: '7px 16px', borderRadius: 'var(--radius-full)', border: 'none',
+                                                        background: 'var(--gradient-accent)', color: '#fff',
+                                                        fontWeight: 700, fontSize: '12px', cursor: 'pointer',
+                                                        display: 'flex', alignItems: 'center', gap: '5px',
+                                                        boxShadow: 'var(--shadow-accent)'
+                                                    }}>
+                                                        Yes, apply it
+                                                    </button>
+                                                    <button onClick={() => dismissFix(i)} style={{
+                                                        padding: '7px 16px', borderRadius: 'var(--radius-full)',
+                                                        border: '1px solid var(--border)', background: 'var(--bg-card)',
+                                                        color: 'var(--text-secondary)', fontWeight: 600,
+                                                        fontSize: '12px', cursor: 'pointer'
+                                                    }}>
+                                                        No thanks
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
                                 ))}
-                                {aiLoading && <Loader2 size={16} className="animate-spin" color="var(--accent)" style={{ margin: '4px 0' }} />}
                             </div>
-                            <form onSubmit={handleChat} style={{ display: 'flex', gap: '8px' }}>
-                                <input className="input-field" value={chatInput} onChange={e => setChatInput(e.target.value)}
-                                    placeholder="Ask about your code..." style={{ flex: 1, fontSize: '13px' }} />
-                                <button className="btn-primary" type="submit" disabled={aiLoading} style={{ padding: '8px 14px' }}>
-                                    <Send size={14} />
-                                </button>
-                            </form>
+
+                            <div style={{ padding: '12px 16px', borderTop: '1px solid var(--border)' }}>
+                                <form onSubmit={handleChat} style={{ display: 'flex', gap: '8px' }}>
+                                    <input className="input-field" value={chatInput} onChange={e => setChatInput(e.target.value)}
+                                        placeholder="Ask about your code..." style={{ flex: 1, fontSize: '13px', padding: '9px 14px' }} />
+                                    <button className="btn-primary" type="submit" disabled={aiLoading} style={{ padding: '9px 16px', flexShrink: 0, borderRadius: 'var(--radius)' }}>
+                                        <Send size={15} />
+                                    </button>
+                                </form>
+                            </div>
                         </div>
                     </div>
                 )}
             </div>
+
+            {/* New File Modal */}
+            {showNewFile && (
+                <div className="modal-backdrop" onClick={e => e.target === e.currentTarget && setShowNewFile(false)}>
+                    <div className="modal fade-in">
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
+                            <div>
+                                <h2 style={{ fontSize: '18px', fontWeight: 700 }}>Create New File</h2>
+                                <p style={{ color: 'var(--text-muted)', fontSize: '13px', marginTop: '2px' }}>Add a new file to your repository</p>
+                            </div>
+                            <button onClick={() => setShowNewFile(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex' }}>
+                                <X size={20} />
+                            </button>
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                            <div>
+                                <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '7px' }}>File name</label>
+                                <input className="input-field" placeholder="e.g. main.py, index.js, README.md" value={newFileName}
+                                    onChange={e => setNewFileName(e.target.value)} style={{ fontFamily: 'JetBrains Mono, monospace' }} />
+                            </div>
+                            <div>
+                                <label style={{ display: 'block', fontSize: '13px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '7px' }}>Content</label>
+                                <textarea value={newFileContent} onChange={e => setNewFileContent(e.target.value)} placeholder="Write your code here..." style={{
+                                    width: '100%', minHeight: '240px', padding: '14px', borderRadius: 'var(--radius)',
+                                    border: '1.5px solid var(--border)', background: '#1E1E2E', color: '#CDD6F4',
+                                    fontFamily: "'JetBrains Mono', monospace", fontSize: '13px',
+                                    lineHeight: 1.7, resize: 'vertical', outline: 'none',
+                                    transition: 'border-color 0.2s'
+                                }} onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+                                    onBlur={e => e.target.style.borderColor = 'var(--border)'} />
+                            </div>
+                            <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+                                <button className="btn-primary" onClick={addNewFile} disabled={!newFileName.trim()} style={{ borderRadius: 'var(--radius)' }}>
+                                    <Plus size={14} /> Create File
+                                </button>
+                                <button className="btn-secondary" onClick={() => setShowNewFile(false)} style={{ borderRadius: 'var(--radius)' }}>Cancel</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     )
 }

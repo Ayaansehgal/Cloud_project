@@ -1,5 +1,14 @@
-import { supabase } from './supabase'
 import { TreeEntry, DiffEntry, Commit } from './types'
+import { createServerClient } from './supabase'
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3'
+
+const s3 = new S3Client({
+    region: process.env.NEXT_PUBLIC_AWS_REGION || process.env.AWS_REGION || 'eu-north-1',
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+    }
+})
 
 export async function hashContent(content: string): Promise<string> {
     const encoder = new TextEncoder()
@@ -22,21 +31,22 @@ export async function createCommit(
     authorId: string,
     aiSummary?: string
 ): Promise<Commit> {
-    const { data: latestCommit } = await supabase
+    const supabase = createServerClient()
+    
+    // Get existing latest commit
+    const { data: existing } = await supabase
         .from('commits')
-        .select('id, integrity_hash')
+        .select('id, tree_hash, integrity_hash')
         .eq('repo_id', repoId)
         .order('created_at', { ascending: false })
         .limit(1)
-        .single()
 
     const treeHash = await computeTreeHash(files)
-    const parentId = latestCommit?.id || null
-    const parentIntegrity = latestCommit?.integrity_hash || '0'.repeat(64)
-
     const timestamp = new Date().toISOString()
-    const integrityInput = `${treeHash}${parentIntegrity}${message}${timestamp}`
-    const integrityHash = await hashContent(integrityInput)
+    const parentId = existing && existing.length > 0 ? existing[0].id : null
+    const previousIntegrity = existing && existing.length > 0 ? existing[0].integrity_hash : '0'.repeat(64)
+    
+    const integrityHash = await hashContent(`${treeHash}${previousIntegrity}${message}${timestamp}`)
 
     const { data: commit, error: commitError } = await supabase
         .from('commits')
@@ -52,36 +62,36 @@ export async function createCommit(
         })
         .select()
         .single()
+        
+    if (commitError) throw new Error(commitError.message)
 
-    if (commitError) throw commitError
-
-    for (const file of files) {
-        const blobHash = await hashContent(file.content)
-
-        const { data: existingBlob } = await supabase
-            .from('blobs')
-            .select('hash')
-            .eq('hash', blobHash)
-            .single()
-
-        if (!existingBlob) {
-            const storagePath = `blobs/${blobHash}`
-            const fileBlob = new Blob([file.content], { type: 'text/plain' })
-            await supabase.storage
-                .from('vcs-files')
-                .upload(storagePath, fileBlob, { upsert: true })
-
+    // Ensure bucket exists or simply upload
+    for (const f of files) {
+        const bHash = await hashContent(f.content)
+        
+        // Upload to storage (Amazon S3)
+        await s3.send(new PutObjectCommand({
+            Bucket: process.env.AWS_S3_BUCKET_NAME || 'cloudvcs-blobs-02aa5720',
+            Key: bHash,
+            Body: f.content,
+            ContentType: 'text/plain'
+        }))
+            
+        // insert into blobs table
+        const { data: blobExists } = await supabase.from('blobs').select('hash').eq('hash', bHash).single()
+        if (!blobExists) {
             await supabase.from('blobs').insert({
-                hash: blobHash,
-                size: file.content.length,
-                storage_path: storagePath
+                hash: bHash,
+                size: new TextEncoder().encode(f.content).length,
+                storage_path: bHash
             })
         }
 
+        // insert tree entry
         await supabase.from('tree_entries').insert({
             commit_id: commit.id,
-            path: file.path,
-            blob_hash: blobHash
+            path: f.path,
+            blob_hash: bHash
         })
     }
 
@@ -89,44 +99,54 @@ export async function createCommit(
 }
 
 export async function getCommitHistory(repoId: string): Promise<Commit[]> {
-    const { data, error } = await supabase
+    const supabase = createServerClient()
+    const { data: commits, error } = await supabase
         .from('commits')
-        .select('*, profiles:author_id(email)')
+        .select(`
+            *,
+            profiles:author_id ( email )
+        `)
         .eq('repo_id', repoId)
         .order('created_at', { ascending: false })
-
-    if (error) throw error
-
-    return (data || []).map(c => ({
+        
+    if (error || !commits) return []
+    
+    // Any is used temporarily for type alignment on profiles relation unwrap
+    return commits.map((c: any) => ({
         ...c,
-        author_email: c.profiles?.email
-    }))
+        author_email: c.profiles?.email || 'unknown@example.com'
+    })) as Commit[]
 }
 
 export async function getCommitFiles(commitId: string): Promise<TreeEntry[]> {
+    const supabase = createServerClient()
     const { data: entries, error } = await supabase
         .from('tree_entries')
         .select('*')
         .eq('commit_id', commitId)
-
-    if (error) throw error
-
-    const filesWithContent = await Promise.all(
-        (entries || []).map(async (entry: TreeEntry) => {
-            const { data } = await supabase.storage
-                .from('vcs-files')
-                .download(entry.blob_hash ? `blobs/${entry.blob_hash}` : entry.path)
-
-            const content = data ? await data.text() : ''
+        
+    if (error || !entries) return []
+    
+    // Fetch content from storage (Amazon S3)
+    const resolvedEntries = await Promise.all(entries.map(async (entry) => {
+        try {
+            const { Body } = await s3.send(new GetObjectCommand({
+                Bucket: process.env.AWS_S3_BUCKET_NAME || 'cloudvcs-blobs-02aa5720',
+                Key: entry.blob_hash
+            }))
+            const content = await Body?.transformToString() || ''
             return { ...entry, content }
-        })
-    )
-
-    return filesWithContent
+        } catch (err) {
+            console.error('S3 GetObject Error:', err)
+            return { ...entry, content: '' }
+        }
+    }))
+    
+    return resolvedEntries
 }
 
 export async function computeDiff(
-    repoId: string,
+    _repoId: string,
     commitIdA: string | null,
     commitIdB: string
 ): Promise<DiffEntry[]> {
@@ -161,11 +181,8 @@ export async function rollbackToCommit(
     authorId: string
 ): Promise<Commit> {
     const files = await getCommitFiles(targetCommitId)
-    const { data: target } = await supabase
-        .from('commits')
-        .select('message')
-        .eq('id', targetCommitId)
-        .single()
+    const supabase = createServerClient()
+    const { data: target } = await supabase.from('commits').select('message').eq('id', targetCommitId).single()
 
     const rollbackFiles = files.map(f => ({
         path: f.path,
