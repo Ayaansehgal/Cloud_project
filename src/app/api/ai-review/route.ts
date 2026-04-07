@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { reviewCode, explainCode, suggestFix, chatWithAI } from '@/lib/ai-review'
+import { reviewCode, explainCode, suggestFix, chatWithAI, analyzeAndFixCode } from '@/lib/ai-review'
 
 export const dynamic = 'force-dynamic'
 
@@ -24,6 +24,10 @@ export async function POST(req: NextRequest) {
             case 'chat': {
                 const answer = await chatWithAI(question, codeContext)
                 return NextResponse.json({ answer })
+            }
+            case 'analyzeAndFix': {
+                const result = await analyzeAndFixCode(code)
+                return NextResponse.json(result)
             }
             default:
                 return NextResponse.json({ error: 'Invalid action' }, { status: 400 })

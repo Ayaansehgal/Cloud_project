@@ -23,13 +23,27 @@ export default function SignupPage() {
                 body: JSON.stringify({ action: 'signup', email, password })
             })
             const data = await res.json()
-            if (!res.ok) { setError(data.error || 'Signup failed'); return }
-            if (data.session) {
+            if (!res.ok) {
+                // Surface friendly messages for common Supabase errors
+                const msg: string = data.error || 'Signup failed'
+                if (msg.toLowerCase().includes('rate limit') || msg.toLowerCase().includes('email') && msg.toLowerCase().includes('limit')) {
+                    setError('Too many signups attempted. Please wait a few minutes and try again, or use a different email.')
+                } else if (msg.toLowerCase().includes('already registered')) {
+                    setError('An account with this email already exists. Please sign in instead.')
+                } else {
+                    setError(msg)
+                }
+                return
+            }
+            // Email confirmation is disabled — session is returned immediately
+            if (data.user) {
                 localStorage.setItem('user', JSON.stringify({ id: data.user.id, email: data.user.email }))
-                localStorage.setItem('session', JSON.stringify(data.session))
+                if (data.session) localStorage.setItem('session', JSON.stringify(data.session))
                 router.push('/dashboard')
-            } else { setDone(true) }
-        } catch { setError('Network error') }
+            } else {
+                setDone(true)
+            }
+        } catch { setError('Network error — please check your connection.') }
         finally { setLoading(false) }
     }
 

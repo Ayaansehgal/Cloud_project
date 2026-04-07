@@ -6,10 +6,12 @@ import Link from 'next/link'
 import {
     GitBranch, GitCommit, Upload, Clock, Shield, ShieldCheck, ShieldAlert,
     FileCode, Brain, MessageSquare, Send, RotateCcw, Loader2, ArrowLeft, Sparkles, Bug, Lightbulb,
-    AlertTriangle, X, Plus, Edit3, Save, Trash2, Play, ChevronRight, Check, FolderOpen
+    AlertTriangle, X, Plus, Edit3, Save, Trash2, Play, ChevronRight, Check, FolderOpen,
+    Eye, Columns, Info, CheckCircle2, Minus
 } from 'lucide-react'
 import { Repository, Commit, TreeEntry, AIReviewResult } from '@/lib/types'
 import { supabase } from '@/lib/supabase'
+import * as Diff from 'diff'
 
 export default function RepoPage() {
     const params = useParams()
@@ -34,6 +36,8 @@ export default function RepoPage() {
     const [commitMsg, setCommitMsg] = useState('')
     const [pushing, setPushing] = useState(false)
     const [showUpload, setShowUpload] = useState(false)
+    const [commitError, setCommitError] = useState('')
+    const [commitSuccess, setCommitSuccess] = useState('')
 
     const [sliderValue, setSliderValue] = useState(0)
     const [sliderFiles, setSliderFiles] = useState<TreeEntry[]>([])
@@ -44,6 +48,8 @@ export default function RepoPage() {
     const [aiReview, setAiReview] = useState<AIReviewResult | null>(null)
     const [aiExplanation, setAiExplanation] = useState('')
     const [aiLoading, setAiLoading] = useState(false)
+    const [showAiFixModal, setShowAiFixModal] = useState(false)
+    const [aiFixResult, setAiFixResult] = useState<{ errors: string[]; explanation: string; fixedCode: string } | null>(null)
     const [mentorAnalytics, setMentorAnalytics] = useState<{ timestamp: string, commitId: string, readabilityScore: number, mentorFeedback: string, criticalBug: boolean }[]>([])
     const [chatMessages, setChatMessages] = useState<{
         role: string; text: string;
@@ -52,6 +58,10 @@ export default function RepoPage() {
     const [chatInput, setChatInput] = useState('')
 
     const [onlineUsers, setOnlineUsers] = useState<{ email: string; current_file: string | null }[]>([])
+    
+    // Interactive Fix Reviewer State
+    const [isReviewingFix, setIsReviewingFix] = useState(false)
+    const [acceptedHunkIds, setAcceptedHunkIds] = useState<Set<number>>(new Set())
 
     const fetchRepo = useCallback(async (userId: string) => {
         try {
@@ -132,10 +142,12 @@ export default function RepoPage() {
         setStagedChanges(prev => prev.filter(f => f.path !== path))
     }
 
-    async function handlePush(e: React.FormEvent) {
-        e.preventDefault()
+    async function handlePush(e?: React.FormEvent) {
+        if (e) e.preventDefault()
         if (!user || stagedChanges.length === 0) return
         setPushing(true)
+        setCommitError('')
+        setCommitSuccess('')
         try {
             const allFiles = files.map(f => {
                 const staged = stagedChanges.find(s => s.path === f.path)
@@ -146,32 +158,51 @@ export default function RepoPage() {
             })
             const res = await fetch('/api/commits', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'x-user-id': user.id },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-user-id': user.id,
+                    'x-user-email': user.email
+                },
                 body: JSON.stringify({ repoId, message: commitMsg || 'Update files', files: allFiles })
             })
             if (res.ok) {
+                const data = await res.json()
                 setStagedChanges([])
                 setCommitMsg('')
-                setShowUpload(false)
+                setCommitSuccess(`Commit saved successfully! (${data.id?.substring(0,8) || 'done'})`)
+                setTimeout(() => { setCommitSuccess(''); setShowUpload(false) }, 2500)
                 fetchRepo(user.id)
+            } else {
+                const errData = await res.json().catch(() => ({ error: 'Unknown error' }))
+                setCommitError(errData.error || `Commit failed (HTTP ${res.status})`)
             }
-        } catch { }
+        } catch (err) {
+            setCommitError(err instanceof Error ? err.message : 'Network error — please check your connection.')
+        }
         finally { setPushing(false) }
     }
 
     function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
         const uploadedFiles = e.target.files
         if (!uploadedFiles) return
-        Array.from(uploadedFiles).forEach(file => {
+        const fileArray = Array.from(uploadedFiles)
+        // Use Promise-based reading to ensure files are completely read before staging
+        Promise.all(fileArray.map(file => new Promise<{ name: string; content: string }>((resolve) => {
             const reader = new FileReader()
-            reader.onload = () => {
-                const content = reader.result as string
-                const newFile: TreeEntry = { id: `upload-${Date.now()}`, commit_id: '', path: file.name, blob_hash: '', content }
-                setFiles(prev => [...prev.filter(f => f.path !== file.name), newFile])
-                setStagedChanges(prev => [...prev.filter(f => f.path !== file.name), { path: file.name, content }])
-            }
+            reader.onload = () => resolve({ name: file.name, content: reader.result as string })
+            reader.onerror = () => resolve({ name: file.name, content: '' })
             reader.readAsText(file)
+        }))).then(results => {
+            results.forEach(({ name, content }) => {
+                const newFile: TreeEntry = { id: `upload-${Date.now()}-${name}`, commit_id: '', path: name, blob_hash: '', content }
+                setFiles(prev => [...prev.filter(f => f.path !== name), newFile])
+                setStagedChanges(prev => [...prev.filter(f => f.path !== name), { path: name, content }])
+            })
+            // Auto-open commit panel when files are uploaded
+            setShowUpload(true)
         })
+        // Reset the file input so the same file can be re-uploaded
+        e.target.value = ''
     }
 
     async function handleSliderChange(idx: number) {
@@ -226,7 +257,14 @@ export default function RepoPage() {
         setAiLoading(true)
         setAiReview(null)
         setTab('ai')
-        const diffs = files.map(f => ({ path: f.path, status: 'added' as const, newContent: f.content }))
+        // Build meaningful diffs — show staged changes as 'modified', rest as context ('added')
+        const diffs = files.map(f => {
+            const staged = stagedChanges.find(s => s.path === f.path)
+            if (staged) {
+                return { path: f.path, status: 'modified' as const, oldContent: f.content || '', newContent: staged.content }
+            }
+            return { path: f.path, status: 'added' as const, newContent: f.content || '' }
+        })
         try {
             const res = await fetch('/api/ai-review', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -236,6 +274,185 @@ export default function RepoPage() {
             setAiReview(data)
         } catch { }
         finally { setAiLoading(false) }
+    }
+
+    async function handleAIAnalyzeAndFix() {
+        if (!selectedFile) return
+        const code = editMode ? editContent : selectedFile.content || ''
+        if (!code) return
+        
+        setAiLoading(true)
+        setAiFixResult(null)
+        try {
+            const res = await fetch('/api/ai-review', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'analyzeAndFix', code })
+            })
+            const data = await res.json()
+            setAiFixResult(data)
+            
+            // Re-calculate hunks based on the new result
+            // Wait, we need to extract hunks first to know the IDs
+            const original = selectedFile.content || ''
+            const fixed = data.fixedCode
+            const diff = Diff.diffLines(original, fixed)
+            let hunkId = 0
+            const initialAccepted = new Set<number>()
+            diff.forEach(part => {
+                if (part.added || part.removed) {
+                    initialAccepted.add(hunkId++)
+                }
+            })
+            setAcceptedHunkIds(initialAccepted)
+            
+            // Enter interactive review mode immediately
+            setIsReviewingFix(true)
+        } catch (e) {
+            setAiFixResult({ errors: ['Network error'], explanation: 'Failed to reach AI service.', fixedCode: code })
+        }
+        setAiLoading(false)
+    }
+
+    async function acceptAllAndCommit() {
+        if (!selectedFile || !aiFixResult || !user) return
+        setPushing(true)
+        try {
+            // 1. Accept all (we already do this by default, but ensuring here)
+            const allIds = currentHunks.filter(h => h.id !== -1).map(h => h.id)
+            const allAccepted = new Set(allIds)
+            
+            // 2. Merge
+            const finalCode = currentHunks.map(h => {
+                if (h.id === -1) return h.value
+                if (h.added) return allAccepted.has(h.id) ? h.value : ''
+                if (h.removed) return allAccepted.has(h.id) ? '' : h.value
+                return ''
+            }).join('')
+
+            // 3. Commit immediately
+            const updatedFiles = files.map(f => f.path === selectedFile.path ? { ...f, content: finalCode } : f)
+            
+            const res = await fetch('/api/commits', {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'x-user-id': user.id,
+                    'x-user-email': user.email
+                },
+                body: JSON.stringify({ 
+                    repoId, 
+                    message: `AI Fix: Resolved bugs in ${selectedFile.path}`, 
+                    files: updatedFiles.map(f => ({ path: f.path, content: f.content || '' }))
+                })
+            })
+
+            if (res.ok) {
+                // Success updates
+                setFiles(updatedFiles)
+                setSelectedFile(prev => prev ? { ...prev, content: finalCode } : prev)
+                setStagedChanges([])
+                setCommitSuccess("AI Fix accepted and committed successfully!")
+                setIsReviewingFix(false)
+                setAiFixResult(null)
+                if (user?.id) fetchRepo(user.id)
+                setTimeout(() => setCommitSuccess(''), 3000)
+            } else {
+                setCommitError("Commit failed — please check your connection.")
+            }
+        } catch (e) {
+            setCommitError("Error during automated commit.")
+        } finally {
+            setPushing(false)
+        }
+    }
+
+    function getHunks() {
+        if (!selectedFile || !aiFixResult) return []
+        const original = selectedFile.content || ''
+        const fixed = aiFixResult.fixedCode
+        const diff = Diff.diffLines(original, fixed)
+        
+        let hunkId = 0
+        const hunks: { id: number; value: string; added?: boolean; removed?: boolean }[] = []
+        
+        diff.forEach(part => {
+            if (part.added || part.removed) {
+                hunks.push({ ...part, id: hunkId++ })
+            } else {
+                hunks.push({ ...part, id: -1 }) // Not a hunk, just context
+            }
+        })
+        return hunks
+    }
+
+    const currentHunks = getHunks()
+
+    function toggleHunk(id: number) {
+        setAcceptedHunkIds(prev => {
+            const next = new Set(prev)
+            if (next.has(id)) next.delete(id)
+            else next.add(id)
+            return next
+        })
+    }
+
+    function acceptAllHunks() {
+        const allIds = currentHunks.filter(h => h.id !== -1).map(h => h.id)
+        setAcceptedHunkIds(new Set(allIds))
+    }
+
+    function finalizeInteractiveFix() {
+        if (!selectedFile || !aiFixResult) return
+        
+        // Construct final code based on accepted hunks
+        const finalCode = currentHunks.map(h => {
+            if (h.id === -1) return h.value // Context line
+            if (h.added) return acceptedHunkIds.has(h.id) ? h.value : ''
+            if (h.removed) return acceptedHunkIds.has(h.id) ? '' : h.value
+            return ''
+        }).join('')
+
+        // Update states as in applyAIFix
+        setFiles(prev => prev.map(f => f.path === selectedFile.path ? { ...f, content: finalCode } : f))
+        setSelectedFile(prev => prev ? { ...prev, content: finalCode } : prev)
+        setStagedChanges(prev => {
+            const without = prev.filter(s => s.path !== selectedFile.path)
+            return [...without, { path: selectedFile.path, content: finalCode }]
+        })
+        
+        setIsReviewingFix(false)
+        setAiFixResult(null)
+        setEditMode(false)
+        setCommitSuccess("Interactive fix finalized and staged!")
+        setTimeout(() => setCommitSuccess(""), 3000)
+        setShowUpload(true)
+    }
+
+    function applyAIFix() {
+        if (!aiFixResult || !selectedFile) return
+        const fixedCode = aiFixResult.fixedCode
+        
+        // Update files state
+        setFiles(prev => prev.map(f => f.path === selectedFile.path ? { ...f, content: fixedCode } : f))
+        
+        // Update selected file
+        setSelectedFile(prev => prev ? { ...prev, content: fixedCode } : prev)
+        
+        // Stage the change automatically
+        setStagedChanges(prev => {
+            const without = prev.filter(s => s.path !== selectedFile.path)
+            return [...without, { path: selectedFile.path, content: fixedCode }]
+        })
+        
+        setShowAiFixModal(false)
+        setAiFixResult(null)
+        setEditMode(false)
+        setCommitSuccess("AI fix applied and staged!")
+        setTimeout(() => setCommitSuccess(""), 3000)
+        
+        // Show the commit panel so user sees it's staged
+        setShowUpload(true)
     }
 
     async function handleAIFix(issue: string) {
@@ -326,6 +543,35 @@ export default function RepoPage() {
         const question = chatInput
         setChatMessages(prev => [...prev, { role: 'user', text: question }])
         setChatInput('')
+
+        // Smart detection: auto-route "fix" and "explain" commands
+        const lowerQ = question.toLowerCase().trim()
+        const fixPatterns = /^(fix|repair|debug|solve|patch|correct)\b/i
+        const explainPatterns = /^(explain|describe|what does|how does|walk me through)\b/i
+
+        if (fixPatterns.test(lowerQ) && selectedFile) {
+            // Auto-route to fix handler
+            const issue = question.replace(fixPatterns, '').trim() || 'Fix any bugs or issues in this code'
+            handleAIFix(issue)
+            return
+        }
+
+        if (explainPatterns.test(lowerQ) && selectedFile) {
+            // Auto-route to explain handler
+            setAiLoading(true)
+            try {
+                const res = await fetch('/api/ai-review', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'explain', code: selectedFile.content || '', filename: selectedFile.path })
+                })
+                const data = await res.json()
+                setChatMessages(prev => [...prev, { role: 'ai', text: data.explanation || 'Could not explain.' }])
+            } catch {
+                setChatMessages(prev => [...prev, { role: 'ai', text: 'AI service unavailable.' }])
+            } finally { setAiLoading(false) }
+            return
+        }
+
         setAiLoading(true)
         try {
             const codeContext = files.map(f => `--- ${f.path} ---\n${f.content}`).join('\n\n')
@@ -404,8 +650,8 @@ export default function RepoPage() {
                     <button className="btn-ghost" onClick={checkIntegrity} disabled={checkingIntegrity} style={{ padding: '7px 14px', fontSize: '13px' }}>
                         {checkingIntegrity ? <Loader2 size={14} className="animate-spin" /> : <Shield size={14} />} Verify
                     </button>
-                    <button className="btn-ghost" onClick={handleAIReview} disabled={aiLoading || files.length === 0} style={{ padding: '7px 14px', fontSize: '13px' }}>
-                        <Sparkles size={14} /> AI Review
+                    <button className="btn-ghost" onClick={handleAIAnalyzeAndFix} disabled={aiLoading || !selectedFile} style={{ padding: '7px 14px', fontSize: '13px' }}>
+                        <Sparkles size={14} /> AI Analyze & Fix
                     </button>
                     <button className="btn-primary" onClick={() => setShowUpload(!showUpload)} style={{ padding: '7px 16px', fontSize: '13px' }}>
                         <Upload size={14} /> Commit
@@ -455,9 +701,21 @@ export default function RepoPage() {
                         </button>
                     </div>
                     <div style={{ padding: '16px 20px' }}>
+                        {/* Success / Error banners */}
+                        {commitSuccess && (
+                            <div className="fade-in" style={{ padding: '10px 14px', marginBottom: '12px', borderRadius: 'var(--radius-sm)', background: 'var(--success-bg)', border: '1px solid rgba(22,163,74,.3)', color: 'var(--success)', fontSize: '13px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <Check size={14} /> {commitSuccess}
+                            </div>
+                        )}
+                        {commitError && (
+                            <div className="fade-in" style={{ padding: '10px 14px', marginBottom: '12px', borderRadius: 'var(--radius-sm)', background: 'var(--danger-bg)', border: '1px solid rgba(220,38,38,.3)', color: 'var(--danger)', fontSize: '13px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <AlertTriangle size={14} /> {commitError}
+                                <button onClick={() => setCommitError('')} style={{ marginLeft: 'auto', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--danger)', display: 'flex' }}><X size={14} /></button>
+                            </div>
+                        )}
                         {stagedChanges.length > 0 && (
                             <div style={{ marginBottom: '12px' }}>
-                                <div style={{ fontSize: '12px', fontWeight: 700, color: 'var(--text-muted)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Staged Changes</div>
+                                <div style={{ fontSize: '12px', fontWeight: 700, color: 'var(--text-muted)', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Staged Changes ({stagedChanges.length})</div>
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                                     {stagedChanges.map(f => (
                                         <div key={f.path} style={{
@@ -477,14 +735,21 @@ export default function RepoPage() {
                                 </div>
                             </div>
                         )}
+                        {stagedChanges.length === 0 && (
+                            <div style={{ padding: '20px', textAlign: 'center', marginBottom: '12px', borderRadius: 'var(--radius-sm)', background: 'var(--bg-hover)', border: '1px dashed var(--border)' }}>
+                                <p style={{ color: 'var(--text-muted)', fontSize: '13px', margin: 0 }}>
+                                    No files staged yet. <strong>Edit a file and click Save</strong>, <strong>create a new file</strong>, or <strong>upload files</strong> to stage changes.
+                                </p>
+                            </div>
+                        )}
                         <form onSubmit={handlePush} style={{ display: 'flex', gap: '10px', alignItems: 'flex-end' }}>
                             <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '8px' }}>
                                 <input type="file" multiple onChange={handleFileUpload} style={{ fontSize: '13px', color: 'var(--text-secondary)' }} />
                                 <input className="input-field" placeholder="Commit message (e.g. 'Fix login bug')" value={commitMsg}
                                     onChange={e => setCommitMsg(e.target.value)} style={{ fontSize: '13px' }} />
                             </div>
-                            <button className="btn-primary" type="submit" disabled={pushing || stagedChanges.length === 0} style={{ padding: '11px 20px', fontSize: '13px', whiteSpace: 'nowrap' }}>
-                                {pushing ? <Loader2 size={14} className="animate-spin" /> : <><GitCommit size={14} /> Commit {stagedChanges.length} file{stagedChanges.length !== 1 ? 's' : ''}</>}
+                            <button className="btn-primary" type="submit" disabled={pushing || stagedChanges.length === 0} style={{ padding: '11px 20px', fontSize: '13px', whiteSpace: 'nowrap', opacity: stagedChanges.length === 0 ? 0.5 : 1 }}>
+                                {pushing ? <><Loader2 size={14} className="animate-spin" /> Saving...</> : <><GitCommit size={14} /> Commit {stagedChanges.length} file{stagedChanges.length !== 1 ? 's' : ''}</>}
                             </button>
                         </form>
                     </div>
@@ -897,6 +1162,159 @@ export default function RepoPage() {
                     </div>
                 )}
             </div>
+
+            {/* Refined Interactive AI Fixer - "The Centered Modal" */}
+            {isReviewingFix && aiFixResult && (
+                <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 sm:p-6 bg-slate-950/80 backdrop-blur-sm transition-all duration-300">
+                    <div className="w-full max-w-6xl h-[90vh] bg-[#0A0A12] border border-white/10 rounded-2xl shadow-2xl flex flex-col overflow-hidden animate-in fade-in zoom-in duration-300">
+                        {/* Toolbar */}
+                        <div className="h-16 border-b border-white/10 flex items-center justify-between px-6 bg-slate-900/40 backdrop-blur-md shrink-0">
+                            <div className="flex items-center gap-4">
+                                <div className="w-10 h-10 rounded-xl bg-indigo-500/20 flex items-center justify-center border border-indigo-500/30">
+                                    <Sparkles className="text-indigo-400" size={20} />
+                                </div>
+                                <div>
+                                    <h2 className="text-base font-bold text-white leading-tight">Interactive AI Fix Reviewer</h2>
+                                    <p className="text-xs text-slate-400">Reviewing edits for <code className="text-indigo-300 font-mono">{selectedFile?.path}</code></p>
+                                </div>
+                            </div>
+                            
+                            <div className="flex items-center gap-3">
+                                <button className="p-2 hover:bg-white/5 rounded-lg text-slate-400 transition-colors" onClick={() => { setIsReviewingFix(false); setAiFixResult(null); }}>
+                                    <X size={20} />
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className="flex-1 flex overflow-hidden">
+                            {/* Summary & Insights Sidebar */}
+                            <div className="w-80 border-r border-white/10 flex flex-col gap-8 p-6 overflow-y-auto bg-slate-950/40 shrink-0 custom-scrollbar">
+                                <section className="space-y-5">
+                                    <div className="flex items-center gap-2 mb-2">
+                                        <div className="w-6 h-6 rounded bg-rose-500/20 flex items-center justify-center border border-rose-500/30">
+                                            <Bug className="text-rose-400" size={14} />
+                                        </div>
+                                        <h3 className="text-[11px] font-black uppercase tracking-widest text-[#FF5F5F] drop-shadow-sm">Reports & Findings</h3>
+                                    </div>
+                                    <div className="space-y-4">
+                                        {(aiFixResult.errors || []).map((err: any, i: number) => (
+                                            <div key={i} className="group relative">
+                                                <div className="absolute -left-1 top-0 bottom-0 w-1 bg-rose-500/40 rounded-full transition-all group-hover:bg-rose-500" />
+                                                <div className="p-4 rounded-xl bg-[#1A1118] border border-rose-500/20 text-xs leading-relaxed text-slate-200 shadow-[0_4px_12px_rgba(0,0,0,0.3)]">
+                                                    <span className="text-rose-400 font-bold block mb-1">ISSUE #{i+1}</span>
+                                                    {err}
+                                                </div>
+                                            </div>
+                                        ))}
+                                        {(!aiFixResult.errors || aiFixResult.errors.length === 0) && (
+                                            <div className="p-4 rounded-xl bg-white/5 border border-dashed border-white/10 text-xs text-slate-500 text-center italic">
+                                                No specific structural bugs identified.
+                                            </div>
+                                        )}
+                                    </div>
+                                </section>
+
+                                <section className="space-y-5">
+                                    <div className="flex items-center gap-2 mb-2">
+                                        <div className="w-6 h-6 rounded bg-blue-500/20 flex items-center justify-center border border-blue-500/30">
+                                            <Lightbulb className="text-blue-400" size={14} />
+                                        </div>
+                                        <h3 className="text-[11px] font-black uppercase tracking-widest text-[#5FBBFF] drop-shadow-sm">Optimization Logic</h3>
+                                    </div>
+                                    <div className="relative">
+                                        <div className="absolute -left-1 top-0 bottom-0 w-1 bg-blue-500/40 rounded-full" />
+                                        <div className="p-5 rounded-xl bg-[#111822] border border-blue-500/20 text-[13px] leading-relaxed text-slate-200 shadow-[0_4px_12px_rgba(0,0,0,0.3)]">
+                                            {aiFixResult.explanation}
+                                        </div>
+                                    </div>
+                                </section>
+
+                                <div className="mt-auto space-y-4 pt-6 border-t border-white/5">
+                                    <div className="p-4 rounded-xl bg-indigo-500/5 border border-indigo-500/20 text-[10px] text-slate-400 leading-normal">
+                                        <strong className="text-indigo-300 block mb-1 uppercase tracking-wider font-extrabold">Final Review</strong>
+                                        Verify all patches. Choosing "Accept & Commit Now" will bypass the manual staging step.
+                                    </div>
+                                    <div className="flex flex-col gap-2">
+                                        <button 
+                                            className="w-full py-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-black uppercase tracking-widest transition-all flex items-center justify-center gap-2 shadow-[0_8px_20px_rgba(79,70,229,0.3)] active:scale-[0.98] disabled:opacity-50"
+                                            onClick={acceptAllAndCommit}
+                                            disabled={pushing}
+                                        >
+                                            {pushing ? <Loader2 size={16} className="animate-spin" /> : <GitCommit size={16} />}
+                                            Accept & Commit Now
+                                        </button>
+                                        <button 
+                                            className="w-full py-3 bg-white/5 hover:bg-white/10 rounded-xl text-[11px] font-bold text-slate-400 transition-all flex items-center justify-center gap-2 border border-white/5"
+                                            onClick={finalizeInteractiveFix}
+                                        >
+                                            <CheckCircle2 size={14} className="text-emerald-400" /> Stage Edits Only
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Interactive Diff Reviewer */}
+                            <div className="flex-1 flex flex-col bg-[#0D1117] overflow-hidden">
+                                <div className="h-10 border-b border-white/5 bg-black/20 flex items-center px-4 justify-between shrink-0">
+                                    <div className="flex items-center gap-3">
+                                        <span className="text-[10px] font-bold tracking-widest text-slate-500 uppercase">Reviewing Code Stream</span>
+                                        <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 text-[9px] font-mono border border-emerald-500/20">+ {currentHunks.filter(h => h.added).length}</span>
+                                        <span className="px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-400 text-[9px] font-mono border border-rose-500/20">- {currentHunks.filter(h => h.removed).length}</span>
+                                    </div>
+                                    <div className="text-[10px] text-slate-500 italic">Toggle each block to include it in the final merge</div>
+                                </div>
+                                
+                                <div className="flex-1 overflow-auto p-0 font-mono text-[13px] leading-relaxed custom-scrollbar">
+                                    {currentHunks.map((hunk, i) => {
+                                        if (hunk.id === -1) {
+                                            return (
+                                                <div key={i} className="flex group min-h-[24px]">
+                                                    <div className="w-12 shrink-0 text-right pr-4 text-slate-600 text-[10px] select-none py-1 border-r border-white/5 group-hover:text-slate-400 transition-colors">
+                                                        {/* Line numbers could be computed here */}
+                                                    </div>
+                                                    <div className="pl-6 py-1 text-slate-500 whitespace-pre opacity-70 group-hover:opacity-100 transition-opacity">
+                                                        {hunk.value}
+                                                    </div>
+                                                </div>
+                                            )
+                                        }
+
+                                        const isAccepted = acceptedHunkIds.has(hunk.id)
+                                        return (
+                                            <div key={i} className={`flex border-l-4 transition-all ${
+                                                hunk.added 
+                                                    ? (isAccepted ? 'bg-emerald-500/10 border-emerald-500' : 'bg-emerald-500/5 border-emerald-500/10 opacity-40 grayscale-[0.5]')
+                                                    : (isAccepted ? 'bg-rose-500/10 border-rose-500' : 'bg-rose-500/5 border-rose-500/10 opacity-40 grayscale-[0.5]')
+                                            }`}>
+                                                <div className={`w-12 shrink-0 flex items-center justify-center border-r border-white/10 ${
+                                                    hunk.added ? 'text-emerald-500' : 'text-rose-500'
+                                                }`}>
+                                                    {hunk.added ? <Plus size={14} /> : <Minus size={14} />}
+                                                </div>
+                                                <div className="flex-1 py-3 pl-6 pr-8 whitespace-pre text-slate-200">
+                                                    {hunk.value}
+                                                </div>
+                                                <div className="w-32 shrink-0 flex items-center justify-center pr-4">
+                                                    <button 
+                                                        onClick={() => toggleHunk(hunk.id)}
+                                                        className={`px-3 py-1.5 rounded-full text-[9px] font-black uppercase tracking-wider transition-all border shadow-sm ${
+                                                            isAccepted 
+                                                                ? 'bg-indigo-600 border-indigo-400 text-white shadow-indigo-500/20' 
+                                                                : 'bg-transparent border-white/10 text-slate-500 hover:border-white/30'
+                                                        }`}
+                                                    >
+                                                        {isAccepted ? 'ACCEPTED' : 'IGNORE'}
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        )
+                                    })}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* New File Modal */}
             {showNewFile && (

@@ -22,11 +22,13 @@ export default function DashboardPage() {
     const [user, setUser] = useState<{ id: string; email: string } | null>(null)
     const [tab, setTab] = useState<'repos' | 'settings'>('repos')
     const [settingsTab, setSettingsTab] = useState<'profile' | 'appearance' | 'notification' | 'account'>('appearance')
-    const [themeColor, setThemeColor] = useState('#3b82f6')
+    const [themeColor, setThemeColor] = useState('#818CF8')
     const [interfaceTheme, setInterfaceTheme] = useState<'light'|'dark'|'system'>('dark')
     const [transparentSidebar, setTransparentSidebar] = useState(false)
+    const [fontFamily, setFontFamily] = useState('Inter')
     const [linkedin, setLinkedin] = useState('')
     const [instagram, setInstagram] = useState('')
+    const [savingProfile, setSavingProfile] = useState(false)
     const router = useRouter()
 
     useEffect(() => {
@@ -35,7 +37,62 @@ export default function DashboardPage() {
         const u = JSON.parse(stored)
         setUser(u)
         fetchRepos(u.id)
+
+        // Load settings from localStorage
+        const settings = JSON.parse(localStorage.getItem('userSettings') || '{}')
+        if (settings.theme) setInterfaceTheme(settings.theme)
+        if (settings.themeColor) setThemeColor(settings.themeColor)
+        if (settings.transparentSidebar !== undefined) setTransparentSidebar(settings.transparentSidebar)
+        if (settings.fontFamily) setFontFamily(settings.fontFamily)
+
+        // Load profile from API
+        fetch('/api/profile', { headers: { 'x-user-id': u.id } })
+            .then(res => res.json())
+            .then(data => {
+                if (data.linkedin_url) setLinkedin(data.linkedin_url)
+                if (data.instagram_handle) setInstagram(data.instagram_handle)
+            })
+            .catch(() => {})
     }, [router])
+
+    useEffect(() => {
+        if (!user) return
+        localStorage.setItem('userSettings', JSON.stringify({ theme: interfaceTheme, themeColor, transparentSidebar, fontFamily }))
+
+        if (interfaceTheme === 'light' || (interfaceTheme === 'system' && window.matchMedia('(prefers-color-scheme: light)').matches)) {
+            document.documentElement.setAttribute('data-theme', 'light')
+        } else {
+            document.documentElement.removeAttribute('data-theme')
+        }
+
+        if (themeColor && themeColor !== '#818CF8') {
+            document.documentElement.style.setProperty('--accent', themeColor)
+            document.documentElement.style.setProperty('--gradient-accent', `linear-gradient(135deg, ${themeColor} 0%, #C084FC 100%)`)
+        } else {
+            document.documentElement.style.removeProperty('--accent')
+            document.documentElement.style.removeProperty('--gradient-accent')
+        }
+
+        document.documentElement.style.setProperty('--font-body', fontFamily)
+
+    }, [interfaceTheme, themeColor, transparentSidebar, fontFamily, user])
+
+    async function saveProfileChanges() {
+        if (!user) return
+        setSavingProfile(true)
+        try {
+            await fetch('/api/profile', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-user-id': user.id },
+                body: JSON.stringify({ linkedin_url: linkedin, instagram_handle: instagram })
+            })
+            alert('Profile updated successfully!')
+        } catch (e) {
+            alert('Failed to update profile')
+        } finally {
+            setSavingProfile(false)
+        }
+    }
 
     async function fetchRepos(userId: string) {
         try {
@@ -62,8 +119,12 @@ export default function DashboardPage() {
                 setShowCreate(false)
                 setNewName('')
                 setNewDesc('')
+            } else {
+                alert(`Error: ${data.error || 'Failed to create repository'}`)
             }
-        } catch { }
+        } catch (e: any) { 
+            alert(`Error: ${e.message || 'Network error'}`)
+        }
         finally { setCreating(false) }
     }
 
@@ -93,7 +154,7 @@ export default function DashboardPage() {
     return (
         <div className="app-shell">
             {/* Sidebar */}
-            <aside className="sidebar">
+            <aside className={`sidebar ${transparentSidebar ? 'sidebar-transparent' : ''}`}>
                 {/* Logo */}
                 <div style={{ padding: '20px 20px 16px', borderBottom: '1px solid var(--border)' }}>
                     <Link href="/dashboard" style={{ display: 'flex', alignItems: 'center', gap: '10px', textDecoration: 'none' }}>
@@ -291,7 +352,7 @@ export default function DashboardPage() {
                                             <h3 style={{ fontSize: '15px', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '8px' }}>Theme Color</h3>
                                             <p style={{ fontSize: '14px', color: 'var(--text-muted)', marginBottom: '20px' }}>Personalize your dashboard using your brand palette.</p>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
-                                                {['#27272a', '#2563eb', '#3b82f6', '#0ea5e9', '#8b5cf6', '#d946ef', '#ec4899', '#f43f5e', '#f97316', '#eab308', '#22c55e'].map(color => (
+                                                {['#27272a', '#2563eb', '#3b82f6', '#0ea5e9', '#8b5cf6', '#d946ef', '#ec4899', '#f43f5e', '#f97316', '#eab308', '#22c55e', '#818CF8'].map(color => (
                                                     <button key={color} onClick={() => setThemeColor(color)} style={{
                                                         width: '32px', height: '32px', borderRadius: '50%', background: color, border: 'none', cursor: 'pointer',
                                                         boxShadow: themeColor === color ? `0 0 0 2px var(--bg-hover), 0 0 0 4px ${color}` : 'none',
@@ -388,11 +449,15 @@ export default function DashboardPage() {
                                                     <p style={{ fontSize: '14px', color: 'var(--text-muted)' }}>Style of texts and heading</p>
                                                 </div>
                                                 <div style={{ display: 'flex', background: 'var(--bg-hover)', borderRadius: '8px', border: '1px solid var(--border)', overflow: 'hidden' }}>
-                                                    {['Aa', 'Aa', 'Aa'].map((font, i) => (
-                                                        <div key={i} style={{
-                                                            padding: '10px 16px', fontSize: '14px', fontWeight: i === 0 ? 600 : 400, color: 'var(--text-secondary)', fontFamily: i === 2 ? 'monospace' : 'inherit',
-                                                            background: i === 0 ? 'var(--bg-card)' : 'transparent', borderRight: i < 2 ? '1px solid var(--border)' : 'none', cursor: 'pointer'
-                                                        }}>{font}</div>
+                                                    {[
+                                                        { name: 'Inter', show: 'Aa' },
+                                                        { name: 'Georgia, serif', show: 'Aa' },
+                                                        { name: 'JetBrains Mono, monospace', show: 'Aa' }
+                                                    ].map((font, i) => (
+                                                        <div key={i} onClick={() => setFontFamily(font.name)} style={{
+                                                            padding: '10px 16px', fontSize: '14px', fontWeight: fontFamily === font.name ? 600 : 400, color: fontFamily === font.name ? 'var(--accent)' : 'var(--text-secondary)', fontFamily: font.name,
+                                                            background: fontFamily === font.name ? 'var(--bg-card)' : 'transparent', borderRight: i < 2 ? '1px solid var(--border)' : 'none', cursor: 'pointer'
+                                                        }}>{font.show}</div>
                                                     ))}
                                                 </div>
                                             </div>
@@ -452,8 +517,8 @@ export default function DashboardPage() {
                                                     </div>
                                                 </div>
 
-                                                <button className="btn-primary" style={{ width: 'fit-content', padding: '10px 20px', fontSize: '14px', background: themeColor }}>
-                                                    Save Profile Changes
+                                                <button onClick={saveProfileChanges} disabled={savingProfile} className="btn-primary" style={{ width: 'fit-content', padding: '10px 20px', fontSize: '14px', background: themeColor }}>
+                                                    {savingProfile ? 'Saving...' : 'Save Profile Changes'}
                                                 </button>
                                             </div>
                                         </div>
