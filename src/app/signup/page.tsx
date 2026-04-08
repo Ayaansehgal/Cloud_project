@@ -35,10 +35,10 @@ export default function SignupPage() {
                 }
                 return
             }
-            // Email confirmation is disabled — session is returned immediately
-            if (data.user) {
+            // If email confirmation is enabled, session will be null here.
+            if (data.user && data.session) {
                 localStorage.setItem('user', JSON.stringify({ id: data.user.id, email: data.user.email }))
-                if (data.session) localStorage.setItem('session', JSON.stringify(data.session))
+                localStorage.setItem('session', JSON.stringify(data.session))
                 router.push('/dashboard')
             } else {
                 setDone(true)
