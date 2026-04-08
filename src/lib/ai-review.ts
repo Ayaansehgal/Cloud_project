@@ -10,7 +10,7 @@ function getGenAI() {
 // Try primary model, fall back to flash-lite on quota errors
 async function generateWithFallback(prompt: string): Promise<string> {
     const genAI = getGenAI()
-    const models = ['gemini-2.5-flash', 'gemini-2.0-flash-lite', 'gemini-pro']
+    const models = ['gemini-1.5-flash-latest', 'gemini-1.5-pro-latest', 'gemini-1.5-flash', 'gemini-pro']
     let lastError: Error = new Error('All models failed')
 
     for (const modelName of models) {
