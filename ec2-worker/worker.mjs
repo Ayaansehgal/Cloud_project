@@ -21,7 +21,7 @@ const supabase = createClient(
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 async function processMessage(msg) {
-    console.log(`\n📨 Received SQS Message: ${msg.MessageId}`);
+    console.log(`\n--- Received SQS Message: ${msg.MessageId} ---`);
     const body = JSON.parse(msg.Body);
     const { repoId, commitId, userId } = body;
 
@@ -68,7 +68,7 @@ Return ONLY valid JSON in this exact structure:
   "bugs_found": ["bug 1", "bug 2"]
 }`;
 
-    // 4. Gemini "AI Mentor" Prompt
+    // 4. Try multiple Gemini models
     const modelNames = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
     let aiResult;
     
@@ -84,21 +84,21 @@ Return ONLY valid JSON in this exact structure:
             const rawText = result.response.text();
             const cleanedText = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
             aiResult = JSON.parse(cleanedText);
-            console.log(`✅ AI Mentor Review Complete. Score: ${aiResult.readability_score}/100`);
+            console.log(`[OK] AI Mentor Review Complete. Score: ${aiResult.readability_score}/100`);
             break; // Success!
         } catch (e) {
             console.error(`[AI Warning] Model ${modelName} failed:`, e.message);
             if (modelName === modelNames[modelNames.length - 1]) {
-                console.error("❌ All AI models failed.");
+                console.error("[ERROR] All AI models failed.");
                 return;
             }
         }
     }
 
-    // 4. Update the Commit in Supabase with the AI Summary
+    // 5. Update the Commit in Supabase with the AI Summary
     await supabase.from('commits').update({ ai_summary: aiResult.summary }).eq('id', commitId);
 
-    // 5. Write Analytics to DynamoDB (Polyglot Persistence)
+    // 6. Write Analytics to DynamoDB (Polyglot Persistence)
     await dynamodb.send(new PutItemCommand({
         TableName: "CloudVCS_Analytics",
         Item: {
@@ -111,21 +111,27 @@ Return ONLY valid JSON in this exact structure:
             "critical_bug": { BOOL: !!aiResult.is_critical_bug }
         }
     }));
-    console.log(`✅ Saved readbility score ${aiResult.readability_score} to DynamoDB.`);
+    console.log(`[OK] Saved readability score ${aiResult.readability_score} to DynamoDB.`);
 
-    // 6. Push to SNS if critical bug found
+    // 7. Push to SNS if critical bug found
     if (aiResult.is_critical_bug || (aiResult.bugs_found && aiResult.bugs_found.length > 0)) {
-        console.log("⚠️ Critical bug detected! Publishing to Amazon SNS...");
+        console.log("[ALERT] Critical bug detected! Publishing to Amazon SNS...");
         await sns.send(new PublishCommand({
             TopicArn: process.env.AWS_SNS_TOPIC_ARN,
             Subject: `CloudVCS AI Mentor Alert!`,
             Message: `Hi there! Your AI Mentor noticed a bug in your latest commit.\n\nSummary: ${aiResult.summary}\n\nFeedback:\n${aiResult.mentor_feedback}\n\nBugs Found:\n- ${aiResult.bugs_found.join('\n- ')}\n\nHappy coding!`
         }));
     }
+
+    console.log(`[OK] Finished processing commit ${commitId}.`);
 }
 
 async function pollQueue() {
-    console.log("☁️  CloudVCS Serverless Mentor Worker is listening to SQS...");
+    console.log("=== CloudVCS Worker Started ===");
+    console.log(`Region: ${region}`);
+    console.log(`Timestamp: ${new Date().toISOString()}`);
+    console.log("Listening to SQS for new commits...\n");
+    
     const queueUrl = process.env.AWS_SQS_QUEUE_URL;
 
     while (true) {
